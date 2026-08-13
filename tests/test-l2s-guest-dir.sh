@@ -12,9 +12,7 @@ command -v mktemp > /dev/null || exit 125
 # busybox must be static to run inside an empty rootfs
 $BB --help > /dev/null 2>&1 || exit 125
 if command -v ldd > /dev/null 2>&1; then
-    if ldd "$BB" > /dev/null 2>&1; then
-        exit 125
-    fi
+    ldd "$BB" > /dev/null 2>&1 && exit 125
 fi
 
 TMP=$(mktemp -d) || exit 125
