@@ -35,6 +35,7 @@
 #define DELETED_SUFFIX " (deleted)"
 
 static int decrement_link_count(Tracee *tracee, Reg sysarg);
+static int l2s_content_to_host(Tracee *tracee, const char content[PATH_MAX], char host[PATH_MAX]);
 
 /**
  * Configuration of this extension, attached to each tracee.  It only
@@ -230,27 +231,30 @@ static int open_l2s_directory(Tracee *tracee)
  * Tell how @path has to be named.  On success *@dir_fd is a descriptor
  * on the l2s directory and *@name is the entry in it, or *@dir_fd is -1
  * and *@name is @path itself when @path doesn't lie directly in that
- * directory -- no l2s directory configured, an intermediate created
- * next to its file, or a chain some older version left elsewhere.
- *
- * This function returns -1 with errno set when @path *is* in the l2s
- * directory but that directory can't be opened.  Falling back to the
- * plain path there would defeat the whole point, since that is exactly
- * the state a tracee arranges when it wants the operation to land
- * somewhere else.
+ * directory -- no descriptor open yet, an intermediate created next to
+ * its file, or a chain some older version left elsewhere.  Only the
+ * syscall handlers establish the descriptor (c.f. open_l2s_directory),
+ * so a caller that needs it open must call that one first; falling
+ * back to the plain path here is what reads and canonicalization want,
+ * since neither may resolve anything (see the comment in the body).
  */
 static int l2s_entry(Tracee *tracee, const char *path, int *dir_fd, const char **name)
 {
-	const char *host;
 	const char *base;
 	size_t length;
-	int fd;
+
+	(void) tracee;
 
 	*dir_fd = -1;
 	*name = path;
 
-	host = l2s_host_directory(tracee);
-	if (host == NULL)
+	/* Nothing is resolved here: the host form and the descriptor are
+	 * established by the syscall handlers (c.f. open_l2s_directory).
+	 * Computing them inside a canonicalization callback would call
+	 * translate_path() from within translate_path(), which recurses
+	 * until the stack is gone.  Until then, a matching path falls
+	 * back to the plain syscall, which is what reads need anyway.  */
+	if (l2s_directory_fd < 0)
 		return 0;
 
 	/* Entries are named either in the host form -- syscalls on the
@@ -258,7 +262,8 @@ static int l2s_entry(Tracee *tracee, const char *path, int *dir_fd, const char *
 	 * symbolic link; match whichever spelling @path uses.  */
 	if (l2s_path_in(path, l2s_directory, l2s_directory_length))
 		length = l2s_directory_length;
-	else if (l2s_path_in(path, host, l2s_dir_host_length))
+	else if (l2s_dir_host_known
+		 && l2s_path_in(path, l2s_dir_host, l2s_dir_host_length))
 		length = l2s_dir_host_length;
 	else
 		return 0;
@@ -267,13 +272,7 @@ static int l2s_entry(Tracee *tracee, const char *path, int *dir_fd, const char *
 	if (base[0] == '\0' || strchr(base, '/') != NULL)
 		return 0;
 
-	fd = open_l2s_directory(tracee);
-	if (fd < 0) {
-		errno = -fd;
-		return -1;
-	}
-
-	*dir_fd = fd;
+	*dir_fd = l2s_directory_fd;
 	*name = base;
 
 	return 0;
@@ -285,19 +284,6 @@ static int l2s_entry(Tracee *tracee, const char *path, int *dir_fd, const char *
  * when that is where it lies.  They keep the return convention of the
  * calls they stand for: 0 or -1 with errno set.
  */
-static int l2s_access(Tracee *tracee, const char *path)
-{
-	const char *name;
-	int dir_fd;
-
-	if (l2s_entry(tracee, path, &dir_fd, &name) < 0)
-		return -1;
-
-	/* No AT_SYMLINK_NOFOLLOW: access(2) follows, and a dangling
-	 * intermediate has always counted as a free slot here.  */
-	return (dir_fd < 0) ? access(path, F_OK) : faccessat(dir_fd, name, F_OK, 0);
-}
-
 static int l2s_symlink(Tracee *tracee, const char *target, const char *path)
 {
 	const char *name;
@@ -559,6 +545,7 @@ static const char *recall_fd(pid_t pid, int fd)
 static void readlink_proc_fd(Tracee *tracee, struct readlink_proc_fd_state *state)
 {
 	char final[PATH_MAX];
+	char final_host[PATH_MAX];
 	const char *link;
 
 	/* Only files that live in the l2s directory are reported by the
@@ -571,10 +558,14 @@ static void readlink_proc_fd(Tracee *tracee, struct readlink_proc_fd_state *stat
 		return;
 
 	/* Descriptor numbers get reused and links get removed, so ensure
-	 * the remembered name still leads to this very file.  */
+	 * the remembered name still leads to this very file.  Chain
+	 * content is compared in its host form, since it may be stored
+	 * guest-form (c.f. l2s_content_to_host).  */
 	if (resolve_faked_hard_link(tracee, link, final) < 0)
 		return;
-	if (strcmp(final, state->host_path) != 0)
+	if (l2s_content_to_host(tracee, final, final_host) < 0)
+		return;
+	if (strcmp(final_host, state->host_path) != 0)
 		return;
 
 	strcpy(state->host_path, link);
@@ -805,6 +796,14 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 			 * left under that name -- instead of surfacing as
 			 * whichever of the operations below fails first.  */
 			status = open_l2s_directory(tracee);
+			if (status == -ENOENT) {
+				/* The configured l2s directory doesn't exist
+				 * (never created, or deleted by the guest):
+				 * recreate it and retry.  The host form is
+				 * already cached, so the retry succeeds.  */
+				if (mkdir(host, 0700) == 0)
+					status = open_l2s_directory(tracee);
+			}
 			if (status < 0)
 				return status;
 
@@ -957,6 +956,12 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 	/* Check if an l2s file is pointed to */
 	if (strncmp(name, PREFIX, strlen(PREFIX)) != 0)
 		return 0;
+
+	/* Pin the l2s directory before its entries are touched, so the
+	 * writes below land on the inode the chain was built against even
+	 * when no link(2) ran earlier in this instance.  Best effort: on
+	 * failure the writes below fall back to the plain syscalls.  */
+	(void) open_l2s_directory(tracee);
 
 	/* Read intermediate link - if this fails then
 	 * this link2symlink is broken and we silently
@@ -1258,6 +1263,7 @@ static void remember_opened_link(Extension *extension, const char host_path[PATH
 	Tracee *tracee = TRACEE(extension);
 	Link2SymlinkConfig *config;
 	char final[PATH_MAX];
+	char final_host[PATH_MAX];
 
 	if (!is_l2s_file(host_path))
 		return;
@@ -1268,10 +1274,14 @@ static void remember_opened_link(Extension *extension, const char host_path[PATH
 
 	/* Ensure the name that was dereferenced while this path was
 	 * canonicalized is indeed a faked hard link to this very file:
-	 * the tracee may have named the l2s file directly.  */
+	 * the tracee may have named the l2s file directly.  Chain
+	 * content is compared in its host form, since it may be stored
+	 * guest-form (c.f. l2s_content_to_host).  */
 	if (resolve_faked_hard_link(tracee, config->final_component, final) < 0)
 		return;
-	if (strcmp(final, host_path) != 0)
+	if (l2s_content_to_host(tracee, final, final_host) < 0)
+		return;
+	if (strcmp(final_host, host_path) != 0)
 		return;
 
 	strcpy(config->pending_link, config->final_component);
@@ -1287,10 +1297,18 @@ static void remember_opened_link(Extension *extension, const char host_path[PATH
  * point it (internally) points to.
  */
 static void translated_path(Extension *extension, char translated_path[PATH_MAX])
+{
 	Tracee *tracee = TRACEE(extension);
 	char final[PATH_MAX];
 	char final_host[PATH_MAX];
 	Sysnum sysnum = get_sysnum(tracee, ORIGINAL);
+
+	/* Resolving a hop calls translate_path(), which notifies
+	 * TRANSLATED_PATH again for the very path being resolved; guard
+	 * against re-entering this handler or the recursion never ends.  */
+	static bool in_progress;
+	if (in_progress)
+		return;
 
 	if (   sysnum == PR_unlink
 	    || sysnum == PR_unlinkat
@@ -1305,6 +1323,8 @@ static void translated_path(Extension *extension, char translated_path[PATH_MAX]
 	if (should_skip_file_access_due_to_f2fs_bug(tracee, translated_path))
 		return;
 
+	in_progress = true;
+
 	/* The canonicalization dereferenced the faked hard links this
 	 * path was made of, including its last component when this
 	 * syscall is about to return a descriptor on it.  */
@@ -1312,15 +1332,17 @@ static void translated_path(Extension *extension, char translated_path[PATH_MAX]
 		remember_opened_link(extension, translated_path);
 
 	if (resolve_faked_hard_link(tracee, translated_path, final) < 0)
-		return;
+		goto out;
 
 	/* Chain content is written in the form the in-guest canonicalizer
 	 * dereferences it in -- a guest path when PROOT_L2S_DIR is given
 	 * as one -- so hand the caller a host path either way.  */
 	if (l2s_content_to_host(tracee, final, final_host) < 0)
-		return;
+		goto out;
 
 	strcpy(translated_path, final_host);
+out:
+	in_progress = false;
 }
 
 /**
