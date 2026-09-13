@@ -570,10 +570,25 @@ static void initialize_binding(Tracee *tracee, Binding *binding)
 		strcpy(binding->guest.path, "/");
 
 		/* Remember the type of the final component, it will
-		 * be used in build_glue() later.  */
+		 * be used in build_glue() later.  A symlink host (e.g. the
+		 * /proc/self/fd/N magic links behind -b .../fd/N:/dev/stdin)
+		 * is coerced to S_IFREG like char/block devices: build_glue()
+		 * can't reproduce those with mknod(2), so a regular-file
+		 * placeholder is used instead.  */
 		status = lstat(binding->host.path, &statl);
 		tracee->glue_type = (status < 0 || S_ISBLK(statl.st_mode) || S_ISCHR(statl.st_mode)
+				|| S_ISLNK(statl.st_mode)
 				? S_IFREG : statl.st_mode & S_IFMT);
+
+		/* When the source is a directory but the guest target is
+		 * a symlink, the tracee must perceive the target as a
+		 * directory.  Dereferencing the target's final component
+		 * would register the binding at the symlink's referee
+		 * instead, leaving stat(2) on the literal target path to
+		 * report the underlying symlink -- which breaks the bind.
+		 * Keep the literal target path in that case.  */
+		if (status >= 0 && S_ISDIR(statl.st_mode))
+			dereference = false;
 
 		/* Sanitize the guest path of the binding within the
 		   alternate rootfs since it is assumed by

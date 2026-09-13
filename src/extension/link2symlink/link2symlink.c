@@ -1,14 +1,16 @@
-#include <stdio.h>     /* rename(2), */
+#include <stdio.h>     /* rename(2), renameat(2), */
 #include <stdlib.h>    /* atoi */
-#include <stdbool.h>   /* bool, */
+#include <fcntl.h>     /* open(2), openat(2), AT_FDCWD, O_*, */
 #include <unistd.h>    /* symlink(2), symlinkat(2), readlink(2), lstat(2), unlink(2), unlinkat(2)*/
 #include <string.h>    /* str*, strrchr, strcat, strcpy, strncpy, strncmp */
 #include <sys/types.h> /* lstat(2), */
 #include <sys/stat.h>  /* lstat(2), */
+#include <sys/ptrace.h>/* PTRACE_SYSCALL, */
 #include <errno.h>     /* E*, */
-#include <fcntl.h>     /* AT_FDCWD, */
 #include <limits.h>    /* PATH_MAX, */
 #include <ctype.h>     /* isdigit, */
+#include <stdbool.h>   /* bool, true, false, */
+#include <talloc.h>    /* talloc_*, */
 
 #include "cli/note.h"
 #include "extension/extension.h"
@@ -33,45 +35,246 @@
 static int decrement_link_count(Tracee *tracee, Reg sysarg);
 
 /**
- * -errno for a failed libc call.  Guaranteed negative even if errno
- * was left at 0: a negative extension status is poked verbatim into
- * the guest's result register, so returning a raw -1 surfaces as
- * EPERM ("Operation not permitted") for *every* failure — the exact
- * misleading signature of GlassHaven/Haven#324.
+ * Configuration of this extension, attached to each tracee.  It only
+ * describes the syscall being processed, hence it is never shared with
+ * children.
  */
-static int host_errno(void)
-{
-	return errno > 0 ? -errno : -EPERM;
-}
+typedef struct {
+	/* Host path of the last component of the path being translated,
+	 * as it was named before being dereferenced.  Empty when the
+	 * canonicalization did not reach it yet.  */
+	char final_component[PATH_MAX];
+
+	/* Host path of the faked hard link the syscall being processed
+	 * was redirected away from, when this syscall is about to return
+	 * a descriptor on it.  Empty otherwise.  */
+	char pending_link[PATH_MAX];
+} Link2SymlinkConfig;
 
 /**
- * Whether a real link(2) failure means "hard links unavailable here"
- * (fall back to symlink emulation) as opposed to a real answer the
- * guest must see (EEXIST, ENOENT, ENOSPC, ...).
+ * Return the configuration of this @extension, allocating it first if
+ * @allocate is true.  This function returns NULL if there's none.
  */
-static bool link_errno_means_unsupported(int err)
+static Link2SymlinkConfig *get_config(Extension *extension, bool allocate)
 {
-	return (err == EPERM || err == EACCES || err == EXDEV ||
-	        err == EMLINK || err == EOPNOTSUPP || err == ENOSYS ||
-	        err == EROFS);
-}
-
-/**
- * PROOT_L2S_FORCE override, read once: 1 = always emulate (skip the
- * real-hard-link fast path; keeps tests deterministic on hosts where
- * link(2) succeeds), 0 or unset = try a real hard link first.  The
- * fast path itself is attempted per call — EXDEV/EMLINK are per-path
- * properties, so a global negative cache would let one /sdcard
- * attempt permanently degrade linking on the rootfs.
- */
-static int l2s_force_mode(void)
-{
-	static int mode = -2;
-	if (mode == -2) {
-		const char *env = getenv("PROOT_L2S_FORCE");
-		mode = (env == NULL || env[0] == '\0') ? -1 : (env[0] == '1' ? 1 : 0);
+	if (extension->config == NULL) {
+		if (!allocate)
+			return NULL;
+		extension->config = talloc_zero(extension, Link2SymlinkConfig);
 	}
-	return mode;
+
+	return talloc_get_type(extension->config, Link2SymlinkConfig);
+}
+
+/**
+ * Descriptors that were opened through a faked hard link.  The kernel
+ * only knows such a file under the name it was given in the l2s
+ * directory -- that's what it reports in "/proc/<PID>/fd/<FD>" -- so
+ * these entries remember the name its tracee used instead.  There's no
+ * bookkeeping for close(2), dup(2) or fork(2): an entry that doesn't
+ * describe anymore the file its descriptor refers to is detected when
+ * it is used, then discarded.
+ */
+#define FD_CACHE_SIZE 64
+
+static struct {
+	pid_t pid;
+	int fd;
+	char *link;
+} fd_cache[FD_CACHE_SIZE];
+static size_t fd_cache_index;
+
+/**
+ * The directory PROOT_L2S_DIR asks the backing files to be kept in,
+ * remembered as a descriptor rather than as a name.
+ *
+ * It has to be a descriptor because the operations below are performed
+ * by PRoot itself, with raw host syscalls that no translation applies
+ * to: a tracee that replaces the directory with a symbolic link -- it
+ * only takes "rm -rf" and "ln -s" on a path it owns, inside its own
+ * rootfs, with no concurrency and nothing bound from the host -- has
+ * every backing file created outside the rootfs from then on, at a
+ * destination of its choosing.  The name is resolved afresh by every
+ * one of those syscalls, so checking it beforehand settles nothing;
+ * opening it once, O_NOFOLLOW, and naming each entry (descriptor, name)
+ * afterwards is what ties the writes to the inode that was checked.
+ *
+ * The paths recorded *inside* the symbolic links are deliberately left
+ * as they were, that is, absolute host paths into this directory: that
+ * is what the canonicalization dereferences them through, c.f.
+ * detranslate_path().  Only the syscalls change, never the contents.
+ *
+ * A tracee that re-points the directory afterwards therefore no longer
+ * redirects anything; it merely breaks the links of its own rootfs,
+ * since the descriptor still names the directory the paths spell out.
+ */
+static char l2s_directory[PATH_MAX];
+static size_t l2s_directory_length;
+static int l2s_directory_fd = -1;
+static bool l2s_directory_known;
+
+/**
+ * Copy PROOT_L2S_DIR into @l2s_directory, without its trailing slashes
+ * so that a path can be matched against it by comparison.  This
+ * function returns false if no l2s directory is configured, in which
+ * case each intermediate is created next to the file it stands for and
+ * there is nothing here to protect: that path is canonicalized, hence
+ * already confined to the guest rootfs.
+ */
+static bool get_l2s_directory(void)
+{
+	const char *value;
+	size_t length;
+
+	if (l2s_directory_known)
+		return l2s_directory[0] != '\0';
+
+	l2s_directory_known = true;
+
+	value = getenv("PROOT_L2S_DIR");
+	if (value == NULL || value[0] == '\0')
+		return false;
+
+	length = strlen(value);
+	if (length >= PATH_MAX)
+		return false;
+
+	while (length > 1 && value[length - 1] == '/')
+		length--;
+
+	memcpy(l2s_directory, value, length);
+	l2s_directory[length] = '\0';
+	l2s_directory_length = length;
+
+	return true;
+}
+
+/**
+ * Answer a descriptor on the l2s directory, opening it on first use.
+ * This function returns -errno if it can't be opened -- O_NOFOLLOW, so
+ * a symbolic link left under that name is a refusal and not something
+ * to follow.
+ */
+static int open_l2s_directory(void)
+{
+	if (l2s_directory_fd >= 0)
+		return l2s_directory_fd;
+
+	if (!get_l2s_directory())
+		return -ENOENT;
+
+	l2s_directory_fd = open(l2s_directory,
+				O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (l2s_directory_fd < 0)
+		return errno > 0 ? -errno : -ENOENT;
+
+	return l2s_directory_fd;
+}
+
+/**
+ * Tell how @path has to be named.  On success *@dir_fd is a descriptor
+ * on the l2s directory and *@name is the entry in it, or *@dir_fd is -1
+ * and *@name is @path itself when @path doesn't lie directly in that
+ * directory -- no l2s directory configured, an intermediate created
+ * next to its file, or a chain some older version left elsewhere.
+ *
+ * This function returns -1 with errno set when @path *is* in the l2s
+ * directory but that directory can't be opened.  Falling back to the
+ * plain path there would defeat the whole point, since that is exactly
+ * the state a tracee arranges when it wants the operation to land
+ * somewhere else.
+ */
+static int l2s_entry(const char *path, int *dir_fd, const char **name)
+{
+	const char *base;
+	int fd;
+
+	*dir_fd = -1;
+	*name = path;
+
+	if (!get_l2s_directory())
+		return 0;
+
+	if (strncmp(path, l2s_directory, l2s_directory_length) != 0
+	    || path[l2s_directory_length] != '/')
+		return 0;
+
+	base = path + l2s_directory_length + 1;
+	if (base[0] == '\0' || strchr(base, '/') != NULL)
+		return 0;
+
+	fd = open_l2s_directory();
+	if (fd < 0) {
+		errno = -fd;
+		return -1;
+	}
+
+	*dir_fd = fd;
+	*name = base;
+
+	return 0;
+}
+
+/**
+ * The handful of operations this extension performs on the l2s
+ * directory, each naming its entry relative to the descriptor above
+ * when that is where it lies.  They keep the return convention of the
+ * calls they stand for: 0 or -1 with errno set.
+ */
+static int l2s_access(const char *path)
+{
+	const char *name;
+	int dir_fd;
+
+	if (l2s_entry(path, &dir_fd, &name) < 0)
+		return -1;
+
+	/* No AT_SYMLINK_NOFOLLOW: access(2) follows, and a dangling
+	 * intermediate has always counted as a free slot here.  */
+	return (dir_fd < 0) ? access(path, F_OK) : faccessat(dir_fd, name, F_OK, 0);
+}
+
+static int l2s_symlink(const char *target, const char *path)
+{
+	const char *name;
+	int dir_fd;
+
+	if (l2s_entry(path, &dir_fd, &name) < 0)
+		return -1;
+
+	return (dir_fd < 0) ? symlink(target, path) : symlinkat(target, dir_fd, name);
+}
+
+static int l2s_unlink(const char *path)
+{
+	const char *name;
+	int dir_fd;
+
+	if (l2s_entry(path, &dir_fd, &name) < 0)
+		return -1;
+
+	return (dir_fd < 0) ? unlink(path) : unlinkat(dir_fd, name, 0);
+}
+
+static int l2s_rename(const char *old_path, const char *new_path)
+{
+	const char *old_name;
+	const char *new_name;
+	int old_dir_fd;
+	int new_dir_fd;
+
+	if (l2s_entry(old_path, &old_dir_fd, &old_name) < 0)
+		return -1;
+	if (l2s_entry(new_path, &new_dir_fd, &new_name) < 0)
+		return -1;
+
+	if (old_dir_fd < 0 && new_dir_fd < 0)
+		return rename(old_path, new_path);
+
+	/* An absolute path with AT_FDCWD is the side that isn't in the
+	 * l2s directory -- the file being moved into it, typically.  */
+	return renameat(old_dir_fd < 0 ? AT_FDCWD : old_dir_fd, old_name,
+			new_dir_fd < 0 ? AT_FDCWD : new_dir_fd, new_name);
 }
 
 /**
@@ -80,11 +283,18 @@ static int l2s_force_mode(void)
  */
 static int my_readlink(const char symlink[PATH_MAX], char value[PATH_MAX])
 {
+	const char *name;
+	int dir_fd;
 	ssize_t size;
 
-	size = readlink(symlink, value, PATH_MAX);
+	if (l2s_entry(symlink, &dir_fd, &name) < 0)
+		return -errno;
+
+	size = (dir_fd < 0)
+		? readlink(symlink, value, PATH_MAX)
+		: readlinkat(dir_fd, name, value, PATH_MAX);
 	if (size < 0)
-		return errno > 0 ? -errno : -EINVAL;
+		return size;
 	if (size >= PATH_MAX)
 		return -ENAMETOOLONG;
 	value[size] = '\0';
@@ -93,110 +303,176 @@ static int my_readlink(const char symlink[PATH_MAX], char value[PATH_MAX])
 }
 
 /**
- * Resolve an l2s chain symlink's @content string to a HOST path in
- * @host.  Legacy chains store host-absolute content; guest-content
- * chains (PROOT_L2S_DIR given as a guest path) store guest-absolute
- * content.  Guest content is what makes stubs *readable from inside
- * the guest*: the canonicalizer dereferences symlink content in the
- * guest namespace, and host-absolute content does not reliably
- * detranslate there (observed on Android: every open() through such a
- * stub fails ENOENT while the extension's own host-side walks
- * succeed).  Try the string as a host path first (legacy chains keep
- * working), then translate it as a guest path.
+ * Check whether @sysnum is a syscall that returns a descriptor on the
+ * file it is given the path of.
  */
-static int l2s_content_to_host(Tracee *tracee, const char content[PATH_MAX], char host[PATH_MAX])
+static bool is_open_syscall(Sysnum sysnum)
 {
-	struct stat st;
+	switch (sysnum) {
+	case PR_creat:
+	case PR_open:
+	case PR_openat:
+	case PR_openat2:
+		return true;
 
-	if (content[0] == '/' && lstat(content, &st) == 0) {
-		strcpy(host, content);
-		return 0;
+	default:
+		return false;
 	}
-	if (tracee == NULL)
-		return -ENOENT;
-	return translate_path(tracee, host, AT_FDCWD, content, false);
 }
 
 /**
- * Rewrite the 4-digit refcount suffix at the end of @s to @count.
- * @s must already end in 4 digits (callers guard with strlen checks).
+ * Check whether @host_path names a file this extension has moved into
+ * the l2s directory, that is, "<PREFIX><name><NNNN>.<NNNN>".
  */
-static void l2s_set_suffix(char *s, int count)
+static bool is_l2s_file(const char *host_path)
 {
-	sprintf(s + strlen(s) - 4, "%04d", count);
+	const char *name;
+	size_t length;
+	size_t i;
+
+	name = strrchr(host_path, '/');
+	if (name == NULL)
+		return false;
+	name++;
+
+	if (strncmp(name, PREFIX, strlen(PREFIX)) != 0)
+		return false;
+
+	/* 5 = strlen(".0002")  */
+	length = strlen(name);
+	if (length < strlen(PREFIX) + 5)
+		return false;
+
+	if (name[length - 5] != '.')
+		return false;
+
+	for (i = 1; i <= 4; i++) {
+		if (!isdigit(name[length - i]))
+			return false;
+	}
+
+	return true;
 }
 
 /**
- * Fill @base with the default (sibling) intermediate base for
- * @original: "<dirname(original)>/<PREFIX><name>".  @name must point
- * at the basename inside @original.  Returns 0 or -ENAMETOOLONG.
+ * Copy in @final the path of the file the faked hard link @link -- a
+ * host path -- refers to.  This function returns -errno if @link is
+ * not a faked hard link or if it is a broken one, otherwise 0.
  */
-static int l2s_sibling_base(const char *original, const char *name, char base[PATH_MAX])
+static int resolve_faked_hard_link(const char link[PATH_MAX], char final[PATH_MAX])
 {
-	if (strlen(PREFIX) + strlen(original) + 5 >= PATH_MAX)
-		return -ENAMETOOLONG;
-
-	strncpy(base, original, strlen(original) - strlen(name));
-	base[strlen(original) - strlen(name)] = '\0';
-	strcat(base, PREFIX);
-	strcat(base, name);
-	return 0;
-}
-
-/**
- * Reserve a free "<base>NNNN" name and move @original's payload to
- * "<reserved>.0002".  The reservation is the intermediate symlink
- * itself: symlink(2) fails EEXIST atomically on any existing entry —
- * including a *dangling* one, which the old access(F_OK) scan wrongly
- * reported as free (and two proot instances could reserve the same
- * name).  Chain names are carried in two parallel forms: the *content*
- * form written into symlink targets (guest-absolute for PROOT_L2S_DIR
- * chains, so the guest canonicalizer can deref them) and the *host*
- * form used for the extension's own syscalls; for sibling chains the
- * two are identical.  On success fills all four outputs and returns 0;
- * on failure returns -errno with the reservation released.
- */
-static int l2s_reserve_and_move(const char *original,
-                                const char base_content[PATH_MAX],
-                                const char base_host[PATH_MAX],
-                                char intermediate_content[PATH_MAX],
-                                char intermediate_host[PATH_MAX],
-                                char final_content[PATH_MAX],
-                                char final_host[PATH_MAX])
-{
-	int suffix = 1;
+	char intermediate[PATH_MAX];
+	const char *name;
 	int status;
 
-	for (;;) {
-		if (suffix >= 1000)
-			return -EMLINK;
-		status = snprintf(intermediate_content, PATH_MAX, "%s%04d", base_content, suffix);
-		if (status < 0 || status >= PATH_MAX)
-			return -ENAMETOOLONG;
-		status = snprintf(intermediate_host, PATH_MAX, "%s%04d", base_host, suffix);
-		if (status < 0 || status >= PATH_MAX)
-			return -ENAMETOOLONG;
-		status = snprintf(final_content, PATH_MAX, "%s.0002", intermediate_content);
-		if (status < 0 || status >= PATH_MAX)
-			return -ENAMETOOLONG;
-		status = snprintf(final_host, PATH_MAX, "%s.0002", intermediate_host);
-		if (status < 0 || status >= PATH_MAX)
-			return -ENAMETOOLONG;
-		if (symlink(final_content, intermediate_host) == 0)
-			break;
-		if (errno != EEXIST)
-			return host_errno();
-		suffix++;
-	}
-
-	status = rename(original, final_host);
-	if (status < 0) {
-		status = host_errno();
-		unlink(intermediate_host);	/* release the reservation */
+	status = my_readlink(link, intermediate);
+	if (status < 0)
 		return status;
+
+	name = strrchr(intermediate, '/');
+	if (name == NULL)
+		return -EINVAL;
+	name++;
+
+	if (strncmp(name, PREFIX, strlen(PREFIX)) != 0)
+		return -EINVAL;
+
+	return my_readlink(intermediate, final);
+}
+
+/**
+ * Remember that the descriptor @fd of the process @pid was opened
+ * through the faked hard link @link (a host path).
+ */
+static void remember_fd(pid_t pid, int fd, const char link[PATH_MAX])
+{
+	size_t index;
+	size_t slot;
+	char *copy;
+
+	/* Reuse the entry of this very descriptor, if any, in order to
+	 * not fill the cache with stale duplicates.  */
+	slot = FD_CACHE_SIZE;
+	for (index = 0; index < FD_CACHE_SIZE; index++) {
+		if (fd_cache[index].link != NULL
+		    && fd_cache[index].pid == pid
+		    && fd_cache[index].fd == fd) {
+			slot = index;
+			break;
+		}
 	}
 
-	return 0;
+	if (slot == FD_CACHE_SIZE) {
+		slot = fd_cache_index;
+		fd_cache_index = (fd_cache_index + 1) % FD_CACHE_SIZE;
+	}
+
+	/* Note: entries live as long as PRoot does, they are not talloc'ed
+	 * from any tracee -- descriptors outlive the process that opened
+	 * them, and threads don't share their pid.  */
+	copy = strdup(link);
+	if (copy == NULL)
+		return;
+
+	free(fd_cache[slot].link);
+	fd_cache[slot].link = copy;
+	fd_cache[slot].pid  = pid;
+	fd_cache[slot].fd   = fd;
+}
+
+/**
+ * Return the faked hard link the descriptor @fd of the process @pid
+ * was opened through, or NULL if it is unknown.  Threads share their
+ * descriptors but not their pid, so an entry remembered by a sibling
+ * is returned as a fallback; the caller is expected to check it still
+ * leads to the expected file.
+ */
+static const char *recall_fd(pid_t pid, int fd)
+{
+	const char *fallback = NULL;
+	size_t index;
+
+	for (index = 0; index < FD_CACHE_SIZE; index++) {
+		if (fd_cache[index].link == NULL || fd_cache[index].fd != fd)
+			continue;
+
+		if (fd_cache[index].pid == pid)
+			return fd_cache[index].link;
+
+		fallback = fd_cache[index].link;
+	}
+
+	return fallback;
+}
+
+/**
+ * Report in @state the name its tracee used to open the file its
+ * descriptor refers to, instead of the name this file was given in the
+ * l2s directory.
+ */
+static void readlink_proc_fd(struct readlink_proc_fd_state *state)
+{
+	char final[PATH_MAX];
+	const char *link;
+
+	/* Only files that live in the l2s directory are reported by the
+	 * kernel under a name no tracee ever used.  */
+	if (!is_l2s_file(state->host_path))
+		return;
+
+	link = recall_fd(state->pid, state->fd);
+	if (link == NULL)
+		return;
+
+	/* Descriptor numbers get reused and links get removed, so ensure
+	 * the remembered name still leads to this very file.  */
+	if (resolve_faked_hard_link(link, final) < 0)
+		return;
+	if (strcmp(final, state->host_path) != 0)
+		return;
+
+	strcpy(state->host_path, link);
+	state->substituted = true;
 }
 
 /**
@@ -209,23 +485,16 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 {
 	char original[PATH_MAX];
 	char intermediate[PATH_MAX];
-	char intermediate_host[PATH_MAX];
 	char new_intermediate[PATH_MAX];
-	char base_host[PATH_MAX];
-	char l2s_dir_host[PATH_MAX];
 	char final[PATH_MAX];
-	char final_host[PATH_MAX];
 	char new_final[PATH_MAX];
-	char new_final_host[PATH_MAX];
-	char newpath[PATH_MAX];
 	char * name;
-	const char * l2s_directory;
 	struct stat statl;
 	ssize_t size;
 	int status;
 	int link_count;
 	int first_link = 1;
-	bool used_l2s_dir = false;
+	int intermediate_suffix = 1;
 
 	/* Note: this path was already canonicalized.  */
 	size = read_string(tracee, original, peek_reg(tracee, CURRENT, sysarg), PATH_MAX);
@@ -240,34 +509,6 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		return errno > 0 ? -errno : -ENOENT;
 	if (S_ISDIR(statl.st_mode))
 		return -EPERM;
-
-	/* Try a real hard link first — but only for a regular-file source,
-	 * *after* classification: hard-linking an l2s stub would create a
-	 * referent the chain's refcount never learns about.  On a filesystem
-	 * that supports hard links (ext4/f2fs — the norm for Android
-	 * app-private storage, where the rootfs lives) this is exactly what
-	 * an unwrapped Linux system does, and it keeps true hard-link
-	 * semantics.  The symlink emulation diverges from real hard links
-	 * and breaks tools that link a file to a backup copy — e.g. dpkg
-	 * linking a DB file to its "-old" backup (GlassHaven/Haven#324,
-	 * #328).  Fall back to emulation only when errno says "hard links
-	 * unavailable here"; real answers (EEXIST, ENOENT, ENOSPC, ...) go
-	 * back to the guest.  */
-	if (!S_ISLNK(statl.st_mode) && l2s_force_mode() != 1) {
-		size = read_string(tracee, newpath, peek_reg(tracee, CURRENT, link_target_sysarg), PATH_MAX);
-		if (size < 0)
-			return size;
-		if (size >= PATH_MAX)
-			return -ENAMETOOLONG;
-		if (link(original, newpath) == 0) {
-			poke_reg(tracee, SYSARG_RESULT, 0);
-			set_sysnum(tracee, PR_void);
-			return 0;
-		}
-		if (!link_errno_means_unsupported(errno))
-			return host_errno();
-		/* else fall through to the emulation */
-	}
 
 	/* Check if it is a symbolic link.  */
 	if (S_ISLNK(statl.st_mode)) {
@@ -284,11 +525,6 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 
 		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0)
 			first_link = 0;
-		else
-			/* Plain-symlink source (legacy oddity): the readlink
-			 * target doubles as the intermediate base in both
-			 * forms.  */
-			strcpy(intermediate_host, intermediate);
 	} else {
 		/* compute new name */
 		name = strrchr(original,'/');
@@ -297,134 +533,101 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		else
 			name++;
 
-		l2s_directory = getenv("PROOT_L2S_DIR");
-		if (l2s_directory != NULL && l2s_directory[0]) {
-			struct stat dirst;
-
-			/* Host form of the payload directory: a legacy
-			 * host-path value is used as-is; a guest-path value
-			 * (the recommended form — stub content must be
-			 * guest-derefable, see l2s_content_to_host) is
-			 * translated.  */
-			if (lstat(l2s_directory, &dirst) == 0 && S_ISDIR(dirst.st_mode))
-				strcpy(l2s_dir_host, l2s_directory);
-			else {
-				status = translate_path(tracee, l2s_dir_host, AT_FDCWD, l2s_directory, true);
-				if (status < 0)
-					return status;
-			}
-
-			if (strlen(PREFIX) + strlen(l2s_directory) + strlen(name) + 6 >= PATH_MAX ||
-			    strlen(PREFIX) + strlen(l2s_dir_host) + strlen(name) + 6 >= PATH_MAX)
+		if (get_l2s_directory()) {
+			/* "<l2s>/<PREFIX><name>" plus the four digits of the
+			 * suffix and the ".0002" of the final file.  The
+			 * bound used to be computed from the *directory* of
+			 * @original, which says nothing about the length of
+			 * the name appended here: a short directory and a
+			 * long name passed it and then overran these
+			 * buffers.  */
+			if (l2s_directory_length + strlen(PREFIX) + strlen(name) + 11 >= PATH_MAX)
 				return -ENAMETOOLONG;
 
-			strcpy(intermediate, l2s_directory);
-			if (intermediate[strlen(intermediate) - 1] != '/')
-				strcat(intermediate, "/");
-			strcat(intermediate, PREFIX);
-			strcat(intermediate, name);
-
-			strcpy(intermediate_host, l2s_dir_host);
-			if (intermediate_host[strlen(intermediate_host) - 1] != '/')
-				strcat(intermediate_host, "/");
-			strcat(intermediate_host, PREFIX);
-			strcat(intermediate_host, name);
-
-			used_l2s_dir = true;
-		} else {
-			status = l2s_sibling_base(original, name, intermediate);
+			/* Ask for the descriptor here, so a directory that
+			 * can't be opened is reported with the reason it
+			 * can't -- ENOTDIR for the symbolic link a tracee
+			 * left under that name -- instead of surfacing as
+			 * whichever of the operations below fails first.  */
+			status = open_l2s_directory();
 			if (status < 0)
 				return status;
-			strcpy(intermediate_host, intermediate);
+
+			strcpy(intermediate, l2s_directory);
+			strcat(intermediate, "/");
+		} else {
+			if (strlen(PREFIX) + strlen(original) + 5 >= PATH_MAX)
+				return -ENAMETOOLONG;
+
+			strncpy(intermediate, original, strlen(original) - strlen(name));
+			intermediate[strlen(original) - strlen(name)] = '\0';
 		}
+		strcat(intermediate, PREFIX);
+		strcat(intermediate, name);
 	}
 
 	if (first_link) {
-		/* Move the original content to the new path.  The intermediate
-		 * symlink doubles as an atomic name reservation, and it briefly
-		 * exists before the payload does — every chain reader already
-		 * fail-softs on a dangling intermediate, so the window is
-		 * benign.  */
-		strcpy(new_intermediate, intermediate);
-		strcpy(base_host, intermediate_host);
-		status = l2s_reserve_and_move(original, new_intermediate, base_host,
-		                              intermediate, intermediate_host,
-		                              final, final_host);
-		if (status == -ENOENT && used_l2s_dir) {
-			/* The guest may have deleted the payload directory
-			 * (it is inside the rootfs); recreate it and retry.  */
-			if (mkdir(l2s_dir_host, 0700) == 0)
-				status = l2s_reserve_and_move(original, new_intermediate, base_host,
-				                              intermediate, intermediate_host,
-				                              final, final_host);
-		}
-		if ((status == -EXDEV || status == -ENOENT) && used_l2s_dir) {
-			/* PROOT_L2S_DIR is on another filesystem (or is
-			 * unusable): degrade to the sibling placement rather
-			 * than failing the guest's link().  */
-			status = l2s_sibling_base(original, name, new_intermediate);
-			if (status == 0) {
-				strcpy(base_host, new_intermediate);
-				status = l2s_reserve_and_move(original, new_intermediate, base_host,
-				                              intermediate, intermediate_host,
-				                              final, final_host);
-			}
-		}
+		/*Move the original content to the new path. */
+		do {
+			sprintf(new_intermediate, "%s%04d", intermediate, intermediate_suffix);
+			intermediate_suffix++;
+		} while ((l2s_access(new_intermediate) != -1) && (intermediate_suffix < 1000));
+		strcpy(intermediate, new_intermediate);
+
+		strcpy(final, intermediate);
+		strcat(final, ".0002");
+		status = l2s_rename(original, final);
 		if (status < 0)
 			return status;
-		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) original, (intptr_t) final_host);
+		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) original, (intptr_t) final);
+		if (status < 0)
+			return status;
+
+		/* Symlink the intermediate to the final file.  */
+		status = l2s_symlink(final, intermediate);
 		if (status < 0)
 			return status;
 
 		/* Symlink the original path to the intermediate one.  */
 		status = symlink(intermediate, original);
 		if (status < 0)
-			return host_errno();
-	} else {
-		/*Move the original content to new location, by incrementing count at end of path.
-		 * `intermediate` holds the CONTENT read from the joined stub. */
-		status = l2s_content_to_host(tracee, intermediate, intermediate_host);
-		if (status < 0)
 			return status;
-		size = my_readlink(intermediate_host, final);
+	} else {
+		/*Move the original content to new location, by incrementing count at end of path. */
+		size = my_readlink(intermediate, final);
 		if (size < 0)
 			return size;
-		status = l2s_content_to_host(tracee, final, final_host);
-		if (status < 0)
-			return status;
 
-		if (strlen(final) < 4 || strlen(final_host) < 4)
-			return -EINVAL;
 		link_count = atoi(final + strlen(final) - 4);
 		link_count++;
 
-		strcpy(new_final, final);
-		l2s_set_suffix(new_final, link_count);
-		strcpy(new_final_host, final_host);
-		l2s_set_suffix(new_final_host, link_count);
+		strncpy(new_final, final, strlen(final) - 4);
+		sprintf(new_final + strlen(final) - 4, "%04d", link_count);
 
-		status = rename(final_host, new_final_host);
+		status = l2s_rename(final, new_final);
 		if (status < 0)
-			return host_errno();
-		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final_host, (intptr_t) new_final_host);
+			return status;
+		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final, (intptr_t) new_final);
 		if (status < 0)
 			return status;
 		strcpy(final, new_final);
-		strcpy(final_host, new_final_host);
 		/* Symlink the intermediate to the final file.  */
-		status = unlink(intermediate_host);
+		status = l2s_unlink(intermediate);
 		if (status < 0)
-			return host_errno();
-		status = symlink(final, intermediate_host);
+			return status;
+		status = l2s_symlink(final, intermediate);
 		if (status < 0)
-			return host_errno();
+			return status;
 	}
 
 	/* Perform symlink() operation within PRoot.  */
-	status = read_path(tracee, newpath, peek_reg(tracee, CURRENT, link_target_sysarg));
-	if (status >= 0)
-		status = symlink(intermediate, newpath) < 0 ? host_errno() : 0;
+	status = read_path(tracee, final, peek_reg(tracee, CURRENT, link_target_sysarg));
+	if (status >= 0) {
+		status = symlink(intermediate, final);
+		if (status < 0) status = -errno;
+	}
 	if (status < 0) {
+		status = -errno;
 		decrement_link_count(tracee, sysarg);
 		return status;
 	}
@@ -444,11 +647,8 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 {
 	char original[PATH_MAX];
 	char intermediate[PATH_MAX];
-	char intermediate_host[PATH_MAX];
 	char final[PATH_MAX];
-	char final_host[PATH_MAX];
 	char new_final[PATH_MAX];
-	char new_final_host[PATH_MAX];
 	char * name;
 	struct stat statl;
 	ssize_t size;
@@ -486,62 +686,47 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 
 	/* Read intermediate link - if this fails then
 	 * this link2symlink is broken and we silently
-	 * skip as we were removing it anyway.
-	 * `intermediate` holds the CONTENT read from the stub.  */
-	status = l2s_content_to_host(tracee, intermediate, intermediate_host);
-	if (status < 0) {
-		VERBOSE(tracee, 1, "Skiping deref of broken link2symlink \"%s\" -> \"%s\"", original, intermediate);
-		return 0;
-	}
-	size = my_readlink(intermediate_host, final);
+	 * skip as we were removing it anyway.  */
+	size = my_readlink(intermediate, final);
 	if (size < 0) {
 		VERBOSE(tracee, 1, "Skiping deref of broken link2symlink \"%s\" -> \"%s\"", original, intermediate);
 		return 0;
 	}
-	status = l2s_content_to_host(tracee, final, final_host);
-	if (status < 0) {
-		VERBOSE(tracee, 1, "Skiping deref of broken link2symlink \"%s\" -> \"%s\"", original, intermediate);
-		return 0;
-	}
 
-	if (strlen(final) < 4 || strlen(final_host) < 4)
-		return 0;	/* malformed chain: let the plain unlink proceed */
 	link_count = atoi(final + strlen(final) - 4);
 	link_count--;
 
 	/* Check if it is or is not the last link to delete */
 	if (link_count > 0) {
-		strcpy(new_final, final);
-		l2s_set_suffix(new_final, link_count);
-		strcpy(new_final_host, final_host);
-		l2s_set_suffix(new_final_host, link_count);
+		strncpy(new_final, final, strlen(final) - 4);
+		sprintf(new_final + strlen(final) - 4, "%04d", link_count);
 
-		status = rename(final_host, new_final_host);
+		status = l2s_rename(final, new_final);
 		if (status < 0)
-			return host_errno();
-		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final_host, (intptr_t) new_final_host);
+			return status;
+		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final, (intptr_t) new_final);
 		if (status < 0)
 			return status;
 
 		strcpy(final, new_final);
 
 		/* Symlink the intermediate to the final file.  */
-		status = unlink(intermediate_host);
+		status = l2s_unlink(intermediate);
 		if (status < 0)
-			return host_errno();
+			return status;
 
-		status = symlink(final, intermediate_host);
+		status = l2s_symlink(final, intermediate);
 		if (status < 0)
-			return host_errno();
+			return status;
 	} else {
 		/* If it is the last, delete the intermediate and final */
-		status = unlink(intermediate_host);
+		status = l2s_unlink(intermediate);
 		if (status < 0)
-			return host_errno();
-		status = unlink(final_host);
+			return status;
+		status = l2s_unlink(final);
 		if (status < 0)
-			return host_errno();
-		status = notify_extensions(tracee, LINK2SYMLINK_UNLINK, (intptr_t) final_host, 0);
+			return status;
+		status = notify_extensions(tracee, LINK2SYMLINK_UNLINK, (intptr_t) final, 0);
 		if (status < 0)
 			return status;
 		}
@@ -570,8 +755,9 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
  * Make it so fake hard links look like real hard link with respect to number of links and inode
  * This function returns -errno if an error occured, otherwise 0.
  */
-static int handle_sysexit_end(Tracee *tracee)
+static int handle_sysexit_end(Extension *extension)
 {
+	Tracee *tracee = TRACEE(extension);
 	word_t sysnum;
 
 	sysnum = get_sysnum(tracee, ORIGINAL);
@@ -602,9 +788,7 @@ static int handle_sysexit_end(Tracee *tracee)
 		ssize_t size;
 		char original[PATH_MAX];
 		char intermediate[PATH_MAX];
-		char intermediate_host[PATH_MAX];
 		char final[PATH_MAX];
-		char final_host[PATH_MAX];
 		char * name;
 		struct stat finalStat;
 
@@ -655,11 +839,9 @@ static int handle_sysexit_end(Tracee *tracee)
 		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0) {
 			if (S_ISLNK(statl.st_mode)) {
 				strcpy(intermediate,original);
-				strcpy(intermediate_host,original);
 				goto intermediate_proc;
 			} else {
 				strcpy(final,original);
-				strcpy(final_host,original);
 				goto final_proc;
 			}
 		}
@@ -680,30 +862,14 @@ static int handle_sysexit_end(Tracee *tracee)
 		if (strncmp(name, PREFIX, strlen(PREFIX)) != 0)
 			return 0;
 
-		if (l2s_content_to_host(tracee, intermediate, intermediate_host) < 0)
-			return 0;
-
-		/* Fail soft on a broken l2s chain (a stub whose .l2s.
-		 * intermediate/final backing file has gone missing — e.g.
-		 * an interrupted dpkg run, or a rootfs copied/tarred without
-		 * the hidden .l2s.* files). Returning the error here would
-		 * propagate it to the guest's stat/lstat, which makes the
-		 * stub un-stat-able and therefore un-rm-able (ls/rm/find all
-		 * fail with an error on it). Leave the real syscall result
-		 * instead, so it behaves like an ordinary dangling symlink
-		 * and can be removed. (GlassHaven/Haven#329.) */
-		intermediate_proc: size = my_readlink(intermediate_host, final);
+		intermediate_proc: size = my_readlink(intermediate, final);
 		if (size < 0)
-			return 0;
-		if (l2s_content_to_host(tracee, final, final_host) < 0)
-			return 0;
+			return size;
 
-		final_proc: status = lstat(final_host,&finalStat);
+		final_proc: status = lstat(final,&finalStat);
 		if (status < 0)
-			return 0;
+			return status;
 
-		if (strlen(final) < 4)
-			return 0;
 		finalStat.st_nlink = atoi(final + strlen(final) - 4);
 
 		/* Get the address of the 'stat' structure.  */
@@ -727,6 +893,28 @@ static int handle_sysexit_end(Tracee *tracee)
 		return 0;
 	}
 
+	case PR_creat:                     //int creat(const char *pathname, mode_t mode);
+	case PR_open:                      //int open(const char *pathname, int flags, ...);
+	case PR_openat:                    //int openat(int dirfd, const char *pathname, int flags, ...);
+	case PR_openat2: {                 //int openat2(int dirfd, const char *pathname, struct open_how *how, size_t size);
+		Link2SymlinkConfig *config;
+		word_t result;
+
+		/* Nothing to do unless this open was redirected to an l2s
+		 * file at the enter stage.  */
+		config = get_config(extension, false);
+		if (config == NULL || config->pending_link[0] == '\0')
+			return 0;
+
+		result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+		if ((int) result >= 0)
+			remember_fd(tracee->pid, (int) result, config->pending_link);
+
+		config->pending_link[0] = '\0';
+
+		return 0;
+	}
+
 	default:
 		return 0;
 	}
@@ -737,40 +925,62 @@ static void link2symlink_handle_statx(struct statx_syscall_state *state)
 	if (!(state->statx_buf.stx_mask & STATX_NLINK))
 		return;
 
-	const char *path_ending = strrchr(state->host_path, '/');
-	if (NULL == path_ending)
+	if (!is_l2s_file(state->host_path))
 		return;
 
-	size_t ending_len = strlen(path_ending);
-	if (ending_len < strlen(PREFIX) + 6) /* 6 = strlen("/") + strlen(".0002") */
+	size_t ending_len = strlen(state->host_path);
+	state->statx_buf.stx_nlink = atoi(&state->host_path[ending_len - 4]);
+
+	/* The statx() that PRoot let the kernel perform did succeed, so
+	 * its result was read back from the tracee and is not written
+	 * again unless it is explicitly reported as updated.  */
+	state->updated_stats = true;
+}
+
+/**
+ * Remember the name the tracee of @extension used for the file it is
+ * about to open, when @host_path -- the path this open was redirected
+ * to during the canonicalization -- is a file of the l2s directory.
+ * The kernel knows nothing about faked hard links, so it would report
+ * @host_path in "/proc/<PID>/fd/<FD>", c.f. readlink_proc_fd().
+ */
+static void remember_opened_link(Extension *extension, const char host_path[PATH_MAX])
+{
+	Tracee *tracee = TRACEE(extension);
+	Link2SymlinkConfig *config;
+	char final[PATH_MAX];
+
+	if (!is_l2s_file(host_path))
 		return;
 
-	if (0 != strncmp(path_ending + 1, PREFIX, strlen(PREFIX)))
+	config = get_config(extension, false);
+	if (config == NULL || config->final_component[0] == '\0')
 		return;
 
-	if (path_ending[ending_len - 5] != '.')
+	/* Ensure the name that was dereferenced while this path was
+	 * canonicalized is indeed a faked hard link to this very file:
+	 * the tracee may have named the l2s file directly.  */
+	if (resolve_faked_hard_link(config->final_component, final) < 0)
+		return;
+	if (strcmp(final, host_path) != 0)
 		return;
 
-	for (size_t i = 1; i <= 4; i++) {
-		if (!isdigit(path_ending[ending_len - i]))
-			return;
-	}
+	strcpy(config->pending_link, config->final_component);
 
-	state->statx_buf.stx_nlink = atoi(&path_ending[ending_len - 4]);
+	/* The descriptor number is only known at the exit stage, which
+	 * seccomp lets PRoot skip by default.  */
+	tracee->sysexit_pending = true;
+	tracee->restart_how = PTRACE_SYSCALL;
 }
 
 /**
  * When @translated_path is a faked hard-link, replace it with the
  * point it (internally) points to.
  */
-static void translated_path(Tracee *tracee, char translated_path[PATH_MAX])
+static void translated_path(Extension *extension, char translated_path[PATH_MAX])
 {
-	char path2[PATH_MAX];
-	char path2_host[PATH_MAX];
-	char path[PATH_MAX];
-	char path_host[PATH_MAX];
-	char *component;
-	int status;
+	Tracee *tracee = TRACEE(extension);
+	char final[PATH_MAX];
 
 	/* Don't translate l2s symlinks if call is (un)link */
 	Sysnum sysnum = get_sysnum(tracee, ORIGINAL);
@@ -787,33 +997,16 @@ static void translated_path(Tracee *tracee, char translated_path[PATH_MAX])
 	if (should_skip_file_access_due_to_f2fs_bug(tracee, translated_path))
 		return;
 
-	status = my_readlink(translated_path, path);
-	if (status < 0)
+	/* The canonicalization dereferenced the faked hard links this
+	 * path was made of, including its last component when this
+	 * syscall is about to return a descriptor on it.  */
+	if (is_open_syscall(sysnum))
+		remember_opened_link(extension, translated_path);
+
+	if (resolve_faked_hard_link(translated_path, final) < 0)
 		return;
 
-	component = strrchr(path, '/');
-	if (component == NULL)
-		return;
-	component++;
-
-	if (strncmp(component, PREFIX, strlen(PREFIX)) != 0)
-		return;
-
-	/* Chain content may be a guest path (see l2s_content_to_host);
-	 * resolve each hop to its host form before walking on.  */
-	status = l2s_content_to_host(tracee, path, path_host);
-	if (status < 0)
-		return;
-
-	status = my_readlink(path_host, path2);
-	if (status < 0)
-		return;
-
-	status = l2s_content_to_host(tracee, path2, path2_host);
-	if (status < 0)
-		return;
-
-	strcpy(translated_path, path2_host);
+	strcpy(translated_path, final);
 	return;
 }
 
@@ -955,6 +1148,16 @@ int link2symlink_callback(Extension *extension, ExtensionEvent event,
 		return 0;
 	}
 
+	case SYSCALL_ENTER_START: {
+		/* Forget any dereference that was not consumed by the exit
+		 * stage of the syscall it was made for.  */
+		Link2SymlinkConfig *config = get_config(extension, false);
+		if (config != NULL)
+			config->pending_link[0] = '\0';
+
+		return 0;
+	}
+
 	case SYSCALL_ENTER_END: {
 		Tracee *tracee = TRACEE(extension);
 
@@ -1075,15 +1278,62 @@ int link2symlink_callback(Extension *extension, ExtensionEvent event,
 	}
 
 	case SYSCALL_EXIT_END: {
-		return handle_sysexit_end(TRACEE(extension));
+		return handle_sysexit_end(extension);
+	}
+
+	case GUEST_PATH: {
+		/* A new path is about to be canonicalized.  */
+		Link2SymlinkConfig *config = get_config(extension, false);
+		if (config != NULL)
+			config->final_component[0] = '\0';
+
+		return 0;
+	}
+
+	case HOST_PATH: {
+		/* Remember how the tracee named the last component of the
+		 * path being canonicalized, that is, before PRoot follows
+		 * it -- a faked hard link is a symbolic link.  Only the
+		 * first notification describes it, the last one describes
+		 * what it points to.  This is only worth doing when a
+		 * descriptor is about to be opened on that file.  */
+		Link2SymlinkConfig *config;
+
+		if (!(bool) data2)
+			return 0;
+
+		if (!is_open_syscall(get_sysnum(TRACEE(extension), ORIGINAL)))
+			return 0;
+
+		config = get_config(extension, true);
+		if (config == NULL || config->final_component[0] != '\0')
+			return 0;
+
+		strcpy(config->final_component, (const char *) data1);
+
+		return 0;
 	}
 
 	case TRANSLATED_PATH:
-		translated_path(TRACEE(extension), (char *) data1);
+		translated_path(extension, (char *) data1);
 		return 0;
 
 	case STATX_SYSCALL:
 		link2symlink_handle_statx((struct statx_syscall_state *) data1);
+		return 0;
+
+	case READLINK_PROC_FD:
+		readlink_proc_fd((struct readlink_proc_fd_state *) data1);
+		return 0;
+
+	case INHERIT_PARENT:
+		/* The configuration only describes the syscall being
+		 * processed, hence it can't be shared with the child.  */
+		return 1;
+
+	case INHERIT_CHILD:
+		/* Nothing to inherit: the child's configuration is
+		 * allocated when it is needed.  */
 		return 0;
 
 	default:

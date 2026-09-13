@@ -1,3 +1,5 @@
+#if defined(__ANDROID__) || defined(__BIONIC__)
+
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>       /* strcmp, memset,  */
@@ -246,3 +248,5 @@ int ashmem_memfd_callback(Extension *extension, ExtensionEvent event, intptr_t d
 		return 0;
 	}
 }
+
+#endif /* defined(__ANDROID__) || defined(__BIONIC__) */
