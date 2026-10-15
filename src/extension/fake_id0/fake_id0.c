@@ -75,10 +75,13 @@
 /**
  * Copy config->@field to the tracee's memory location pointed to by @sysarg.
  */
-#define POKE_MEM_ID(sysarg, field) do {					\
-	poke_uint16(tracee, peek_reg(tracee, ORIGINAL, sysarg), config->field);	\
-	if (errno != 0)							\
-		return -errno;						\
+#define POKE_MEM_ID(version, sysarg, field) do {			\
+	word_t addr = peek_reg(tracee, version, sysarg);		\
+	if (addr != 0) {						\
+		poke_uint32(tracee, addr, config->field);		\
+		if (errno != 0)						\
+			return -errno;					\
+	}								\
 } while (0)
 
 /**
@@ -559,17 +562,19 @@ static int handle_perm_err_exit_end(Tracee *tracee, Config *config, bool even_if
 	return 0;
 }
 
-static int handle_getresuid_exit_end(Tracee *tracee, Config *config) {
-	POKE_MEM_ID(SYSARG_1, ruid);
-	POKE_MEM_ID(SYSARG_2, euid);
-	POKE_MEM_ID(SYSARG_3, suid);
+static int handle_getresuid_exit_end(Tracee *tracee, Config *config, RegVersion version) {
+	POKE_MEM_ID(version, SYSARG_1, ruid);
+	POKE_MEM_ID(version, SYSARG_2, euid);
+	POKE_MEM_ID(version, SYSARG_3, suid);
+	poke_reg(tracee, SYSARG_RESULT, 0);
 	return 0;
 }
 
-static int handle_getresgid_exit_end(Tracee *tracee, Config *config) {
-	POKE_MEM_ID(SYSARG_1, rgid);
-	POKE_MEM_ID(SYSARG_2, egid);
-	POKE_MEM_ID(SYSARG_3, sgid);
+static int handle_getresgid_exit_end(Tracee *tracee, Config *config, RegVersion version) {
+	POKE_MEM_ID(version, SYSARG_1, rgid);
+	POKE_MEM_ID(version, SYSARG_2, egid);
+	POKE_MEM_ID(version, SYSARG_3, sgid);
+	poke_reg(tracee, SYSARG_RESULT, 0);
 	return 0;
 }
 
@@ -816,6 +821,26 @@ static int handle_sysenter_end(Tracee *tracee, Config *config)
 	}
 #endif /* ifndef USERLAND */
 
+	case PR_socket:
+		/* On modern kernels socket(AF_NETLINK, SOCK_RAW, NETLINK_AUDIT)
+		 * succeeds for unprivileged callers and defers the CAP_AUDIT_WRITE
+		 * check until sendto(), causing sudo/su/PAM to fail with EPERM
+		 * ("unable to send audit message: Operation not permitted").
+		 * Reject NETLINK_AUDIT at socket creation with -EPROTONOSUPPORT
+		 * so libaudit treats kernel audit as unsupported. */
+		if (peek_reg(tracee, ORIGINAL, SYSARG_1) == 16 /* AF_NETLINK */ &&
+		    peek_reg(tracee, ORIGINAL, SYSARG_3) == 9 /* NETLINK_AUDIT */ &&
+		    (config->euid == 0 || config->caps_active))
+			return -EPROTONOSUPPORT;
+		return 0;
+
+	case PR_getresuid:
+	case PR_getresuid32:
+	case PR_getresgid:
+	case PR_getresgid32:
+		set_sysnum(tracee, PR_void);
+		return 0;
+
 	case PR_setgroups:
 	case PR_setgroups32:
 	case PR_getgroups:
@@ -996,11 +1021,11 @@ static int handle_sysexit_end(Tracee *tracee, Config *config)
 
 	case PR_getresuid:
 	case PR_getresuid32:
-		return handle_getresuid_exit_end(tracee, config);
+		return handle_getresuid_exit_end(tracee, config, ORIGINAL);
 
 	case PR_getresgid:
 	case PR_getresgid32:
-		return handle_getresgid_exit_end(tracee, config);
+		return handle_getresgid_exit_end(tracee, config, ORIGINAL);
 
 #ifdef USERLAND
 	case PR_umask:
@@ -1151,6 +1176,14 @@ static int handle_sigsys(Tracee *tracee, Config *config)
 	case PR_setresgid:
 	case PR_setresgid32:
 		SETRESXID(g, CURRENT);
+
+	case PR_getresuid:
+	case PR_getresuid32:
+		return handle_getresuid_exit_end(tracee, config, CURRENT);
+
+	case PR_getresgid:
+	case PR_getresgid32:
+		return handle_getresgid_exit_end(tracee, config, CURRENT);
 
 	case PR_chroot:
 		return handle_chroot_exit_end(tracee, config, true);
