@@ -604,6 +604,12 @@ static int handle_getresuid_exit_end(Tracee *tracee, Config *config, Sysnum sysn
 	POKE_MEM_ID(sysnum, SYSARG_1, ruid);
 	POKE_MEM_ID(sysnum, SYSARG_2, euid);
 	POKE_MEM_ID(sysnum, SYSARG_3, suid);
+	/* Under seccomp acceleration the kernel never ran the syscall, so the
+	 * guest-visible result stays the -ENOSYS the trap pre-injected.  Force
+	 * the faked success here; on the plain-ptrace path the real syscall
+	 * already returned 0, so this is idempotent (upstream c1cd48d dropped
+	 * it and test-82ba4ba1 regressed on seccomp hosts).  */
+	poke_reg(tracee, SYSARG_RESULT, 0);
 	return 0;
 }
 
@@ -611,6 +617,8 @@ static int handle_getresgid_exit_end(Tracee *tracee, Config *config, Sysnum sysn
 	POKE_MEM_ID(sysnum, SYSARG_1, rgid);
 	POKE_MEM_ID(sysnum, SYSARG_2, egid);
 	POKE_MEM_ID(sysnum, SYSARG_3, sgid);
+	/* See handle_getresuid_exit_end.  */
+	poke_reg(tracee, SYSARG_RESULT, 0);
 	return 0;
 }
 
