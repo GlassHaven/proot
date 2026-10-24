@@ -46,7 +46,8 @@
 #endif
 
 static int decrement_intermediate_count(Tracee *tracee, const char original[PATH_MAX],
-					const char intermediate[PATH_MAX]);
+					const char intermediate_host[PATH_MAX]);
+static int l2s_content_to_host(Tracee *tracee, const char content[PATH_MAX], char host[PATH_MAX]);
 
 /**
  * Configuration of this extension, attached to each tracee.  It only
@@ -66,7 +67,7 @@ typedef struct {
 
 	/* Host path of the faked hard link the syscall being processed
 	 * is about to remove -- unlink(2), or rename(2) onto it -- and
-	 * the intermediate it points to, c.f. remember_removed_link().
+	 * the intermediate content it points to, c.f. remember_removed_link().
 	 * Empty otherwise.  */
 	char removed_link[PATH_MAX];
 	char removed_intermediate[PATH_MAX];
@@ -120,19 +121,25 @@ static size_t fd_cache_index;
  * opening it once, O_NOFOLLOW, and naming each entry (descriptor, name)
  * afterwards is what ties the writes to the inode that was checked.
  *
- * The paths recorded *inside* the symbolic links are deliberately left
- * as they were, that is, absolute host paths into this directory: that
- * is what the canonicalization dereferences them through, c.f.
- * detranslate_path().  Only the syscalls change, never the contents.
+ * When PROOT_L2S_DIR is given as a guest path, the paths recorded
+ * *inside* the symbolic links are written in guest form so the in-guest
+ * canonicalizer can dereference stubs directly; extension-side
+ * consumers normalize chain content to a host path via
+ * l2s_content_to_host(), while legacy host-path PROOT_L2S_DIR values
+ * and sibling chains keep host-form symlink content.
  *
  * A tracee that re-points the directory afterwards therefore no longer
  * redirects anything; it merely breaks the links of its own rootfs,
- * since the descriptor still names the directory the paths spell out.
+ * since the descriptor still names the directory that was opened.
  */
 static char l2s_directory[PATH_MAX];
 static size_t l2s_directory_length;
+static char l2s_dir_host[PATH_MAX];
+static size_t l2s_dir_host_length;
 static int l2s_directory_fd = -1;
 static bool l2s_directory_known;
+static bool l2s_dir_host_known;
+static bool in_l2s_translate;
 
 /**
  * Copy PROOT_L2S_DIR into @l2s_directory, without its trailing slashes
@@ -171,20 +178,89 @@ static bool get_l2s_directory(void)
 }
 
 /**
- * Answer a descriptor on the l2s directory, opening it on first use.
- * This function returns -errno if it can't be opened -- O_NOFOLLOW, so
- * a symbolic link left under that name is a refusal and not something
- * to follow.
+ * Whether @path names something inside @dir -- @length chars of @dir
+ * spelled out, then a slash.
  */
-static int open_l2s_directory(void)
+static bool l2s_path_in(const char *path, const char *dir, size_t length)
 {
+	return strncmp(path, dir, length) == 0 && path[length] == '/';
+}
+
+/**
+ * Translate @guest to @host in @tracee's namespace without triggering
+ * this extension's own GUEST_PATH / SYMLINK_DEREFERENCED /
+ * TRANSLATED_PATH callbacks, which belong to the outer syscall's path
+ * translation and would otherwise clobber per-syscall state or recurse.
+ */
+static int l2s_translate_guest_path(Tracee *tracee, char host[PATH_MAX],
+				    const char *guest, bool deref_final)
+{
+	int status;
+
+	if (tracee == NULL || tracee->fs == NULL)
+		return -ENOENT;
+
+	in_l2s_translate = true;
+	status = translate_path(tracee, host, AT_FDCWD, guest, deref_final);
+	in_l2s_translate = false;
+
+	return status;
+}
+
+/**
+ * Host form of the configured l2s directory: an existing host path is
+ * used as-is (including a non-directory or symlink at that host path,
+ * so open_l2s_directory() rejects it with O_NOFOLLOW), while a guest
+ * path is translated without dereferencing its final component.  The
+ * result is cached once resolved; resolution failures are not cached.
+ */
+static const char *l2s_host_directory(Tracee *tracee)
+{
+	struct stat dirst;
+	size_t length;
+
+	if (l2s_dir_host_known)
+		return l2s_dir_host[0] != '\0' ? l2s_dir_host : NULL;
+
+	if (!get_l2s_directory())
+		return NULL;
+
+	if (lstat(l2s_directory, &dirst) == 0)
+		strcpy(l2s_dir_host, l2s_directory);
+	else {
+		if (l2s_translate_guest_path(tracee, l2s_dir_host,
+					     l2s_directory, false) < 0)
+			return NULL;
+	}
+
+	length = strlen(l2s_dir_host);
+	while (length > 1 && l2s_dir_host[length - 1] == '/')
+		length--;
+	l2s_dir_host[length] = '\0';
+	l2s_dir_host_length = length;
+	l2s_dir_host_known = true;
+
+	return l2s_dir_host;
+}
+
+/**
+ * Answer a descriptor on the l2s directory, opening it on first use
+ * through its host form (see l2s_host_directory()).  This function
+ * returns -errno if it can't be opened -- O_NOFOLLOW, so a symbolic
+ * link left under that name is a refusal and not something to follow.
+ */
+static int open_l2s_directory(Tracee *tracee)
+{
+	const char *host;
+
 	if (l2s_directory_fd >= 0)
 		return l2s_directory_fd;
 
-	if (!get_l2s_directory())
+	host = l2s_host_directory(tracee);
+	if (host == NULL)
 		return -ENOENT;
 
-	l2s_directory_fd = open(l2s_directory,
+	l2s_directory_fd = open(host,
 				O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	if (l2s_directory_fd < 0)
 		return errno > 0 ? -errno : -ENOENT;
@@ -205,26 +281,36 @@ static int open_l2s_directory(void)
  * the state a tracee arranges when it wants the operation to land
  * somewhere else.
  */
-static int l2s_entry(const char *path, int *dir_fd, const char **name)
+static int l2s_entry(Tracee *tracee, const char *path, int *dir_fd, const char **name)
 {
+	const char *host;
 	const char *base;
+	size_t length;
 	int fd;
 
 	*dir_fd = -1;
 	*name = path;
 
-	if (!get_l2s_directory())
+	if (in_l2s_translate || !get_l2s_directory())
 		return 0;
 
-	if (strncmp(path, l2s_directory, l2s_directory_length) != 0
-	    || path[l2s_directory_length] != '/')
+	host = l2s_host_directory(tracee);
+
+	/* Entries are named either in the content form -- the string
+	 * written into a symbolic link -- or in the host form; match
+	 * whichever spelling @path uses.  */
+	if (l2s_path_in(path, l2s_directory, l2s_directory_length))
+		length = l2s_directory_length;
+	else if (host != NULL && l2s_path_in(path, host, l2s_dir_host_length))
+		length = l2s_dir_host_length;
+	else
 		return 0;
 
-	base = path + l2s_directory_length + 1;
+	base = path + length + 1;
 	if (base[0] == '\0' || strchr(base, '/') != NULL)
 		return 0;
 
-	fd = open_l2s_directory();
+	fd = open_l2s_directory(tracee);
 	if (fd < 0) {
 		errno = -fd;
 		return -1;
@@ -237,54 +323,90 @@ static int l2s_entry(const char *path, int *dir_fd, const char **name)
 }
 
 /**
+ * -errno for a failed libc call, guaranteed negative even if errno was
+ * left at 0.
+ */
+static int host_errno(void)
+{
+	return errno > 0 ? -errno : -EPERM;
+}
+
+/**
+ * Whether a real link(2) failure means "hard links unavailable here"
+ * (fall back to symlink emulation) as opposed to a real answer the
+ * guest must see (EEXIST, ENOENT, ENOSPC, ...).
+ */
+static bool link_errno_means_unsupported(int err)
+{
+	return (err == EPERM || err == EACCES || err == EXDEV ||
+		err == EMLINK || err == EOPNOTSUPP || err == ENOSYS ||
+		err == EROFS);
+}
+
+/**
+ * PROOT_L2S_FORCE override, read once: 1 = always emulate (skip the
+ * real-hard-link fast path; keeps tests deterministic on hosts where
+ * link(2) succeeds), 0 or unset = try a real hard link first.
+ */
+static int l2s_force_mode(void)
+{
+	static int mode = -2;
+	if (mode == -2) {
+		const char *env = getenv("PROOT_L2S_FORCE");
+		mode = (env == NULL || env[0] == '\0') ? -1 : (env[0] == '1' ? 1 : 0);
+	}
+	return mode;
+}
+
+/**
  * The handful of operations this extension performs on the l2s
  * directory, each naming its entry relative to the descriptor above
  * when that is where it lies.  They keep the return convention of the
  * calls they stand for: 0 or -1 with errno set.
  */
-static int l2s_lstat(const char *path, struct stat *statl)
+static int l2s_lstat(Tracee *tracee, const char *path, struct stat *statl)
 {
 	const char *name;
 	int dir_fd;
 
-	if (l2s_entry(path, &dir_fd, &name) < 0)
+	if (l2s_entry(tracee, path, &dir_fd, &name) < 0)
 		return -1;
 
 	return (dir_fd < 0) ? lstat(path, statl) : fstatat(dir_fd, name, statl, AT_SYMLINK_NOFOLLOW);
 }
 
-static int l2s_symlink(const char *target, const char *path)
+static int l2s_symlink(Tracee *tracee, const char *target, const char *path)
 {
 	const char *name;
 	int dir_fd;
 
-	if (l2s_entry(path, &dir_fd, &name) < 0)
+	if (l2s_entry(tracee, path, &dir_fd, &name) < 0)
 		return -1;
 
 	return (dir_fd < 0) ? symlink(target, path) : symlinkat(target, dir_fd, name);
 }
 
-static int l2s_unlink(const char *path)
+static int l2s_unlink(Tracee *tracee, const char *path)
 {
 	const char *name;
 	int dir_fd;
 
-	if (l2s_entry(path, &dir_fd, &name) < 0)
+	if (l2s_entry(tracee, path, &dir_fd, &name) < 0)
 		return -1;
 
 	return (dir_fd < 0) ? unlink(path) : unlinkat(dir_fd, name, 0);
 }
 
-static int l2s_rename(const char *old_path, const char *new_path)
+static int l2s_rename(Tracee *tracee, const char *old_path, const char *new_path)
 {
 	const char *old_name;
 	const char *new_name;
 	int old_dir_fd;
 	int new_dir_fd;
 
-	if (l2s_entry(old_path, &old_dir_fd, &old_name) < 0)
+	if (l2s_entry(tracee, old_path, &old_dir_fd, &old_name) < 0)
 		return -1;
-	if (l2s_entry(new_path, &new_dir_fd, &new_name) < 0)
+	if (l2s_entry(tracee, new_path, &new_dir_fd, &new_name) < 0)
 		return -1;
 
 	if (old_dir_fd < 0 && new_dir_fd < 0)
@@ -300,25 +422,55 @@ static int l2s_rename(const char *old_path, const char *new_path)
  * Copy the contents of the @symlink into @value (nul terminated).
  * This function returns -errno if an error occured, otherwise 0.
  */
-static int my_readlink(const char symlink[PATH_MAX], char value[PATH_MAX])
+static int my_readlink(Tracee *tracee, const char symlink[PATH_MAX], char value[PATH_MAX])
 {
 	const char *name;
 	int dir_fd;
 	ssize_t size;
 
-	if (l2s_entry(symlink, &dir_fd, &name) < 0)
+	if (l2s_entry(tracee, symlink, &dir_fd, &name) < 0)
 		return -errno;
 
 	size = (dir_fd < 0)
 		? readlink(symlink, value, PATH_MAX)
 		: readlinkat(dir_fd, name, value, PATH_MAX);
 	if (size < 0)
-		return -errno;
+		return host_errno();
 	if (size >= PATH_MAX)
 		return -ENAMETOOLONG;
 	value[size] = '\0';
 
 	return 0;
+}
+
+/**
+ * Resolve an l2s chain symlink's @content string to a host path in
+ * @host.  Legacy and sibling chains store host-absolute content;
+ * guest-content chains (PROOT_L2S_DIR given as a guest path) store
+ * guest-absolute content so the in-guest canonicalizer can dereference
+ * stubs directly.
+ */
+static int l2s_content_to_host(Tracee *tracee, const char content[PATH_MAX], char host[PATH_MAX])
+{
+	struct stat st;
+
+	if (get_l2s_directory()
+	    && l2s_path_in(content, l2s_directory, l2s_directory_length)
+	    && strchr(content + l2s_directory_length + 1, '/') == NULL) {
+		const char *dir_host = l2s_host_directory(tracee);
+		if (dir_host != NULL) {
+			int n = snprintf(host, PATH_MAX, "%s/%s",
+					 dir_host, content + l2s_directory_length + 1);
+			return (n < 0 || n >= PATH_MAX) ? -ENAMETOOLONG : 0;
+		}
+	}
+
+	if (content[0] == '/' && l2s_lstat(tracee, content, &st) == 0) {
+		strcpy(host, content);
+		return 0;
+	}
+
+	return l2s_translate_guest_path(tracee, host, content, false);
 }
 
 /**
@@ -345,14 +497,14 @@ static bool is_open_syscall(Sysnum sysnum)
 #define MAX_LINK_COUNT 999999999
 
 /**
- * Return the link count recorded in the name of @host_path, a file this
- * extension has moved into the l2s directory, that is,
- * "<PREFIX><name><NNNN>.<count>" where <NNNN> is the suffix of its
- * intermediate and <count> is written with 4 digits at least -- 5 from
- * 10000 links on -- and 9 at most, so it fits an int.  This function
- * returns -1 if @host_path is not named that way.
+ * Return the link count recorded in the name of @path, a file this
+ * extension has moved into the l2s directory (in either host or content
+ * form), that is, "<PREFIX><name><NNNN>.<count>" where <NNNN> is the
+ * suffix of its intermediate and <count> is written with 4 digits at
+ * least -- 5 from 10000 links on -- and 9 at most, so it fits an int.
+ * This function returns -1 if @path is not named that way.
  */
-static int get_link_count(const char *host_path)
+static int get_link_count(const char *path)
 {
 	const char *name;
 	const char *dot;
@@ -360,7 +512,7 @@ static int get_link_count(const char *host_path)
 	size_t i;
 	int count;
 
-	name = strrchr(host_path, '/');
+	name = strrchr(path, '/');
 	if (name == NULL)
 		return -1;
 	name++;
@@ -395,12 +547,12 @@ static int get_link_count(const char *host_path)
 }
 
 /**
- * Check whether @host_path names a file this extension has moved into
+ * Check whether @path names a file this extension has moved into
  * the l2s directory, c.f. get_link_count().
  */
-static bool is_l2s_file(const char *host_path)
+static bool is_l2s_file(const char *path)
 {
-	return get_link_count(host_path) >= 0;
+	return get_link_count(path) >= 0;
 }
 
 /**
@@ -425,16 +577,16 @@ static int name_link_count(const char final[PATH_MAX], int link_count, char new_
 }
 
 /**
- * Copy in @intermediate the path of the intermediate the faked hard
+ * Copy in @intermediate the content of the intermediate the faked hard
  * link @link -- a host path -- points to.  This function returns
  * -errno if @link is not a faked hard link, otherwise 0.
  */
-static int read_faked_hard_link(const char link[PATH_MAX], char intermediate[PATH_MAX])
+static int read_faked_hard_link(Tracee *tracee, const char link[PATH_MAX], char intermediate[PATH_MAX])
 {
 	const char *name;
 	int status;
 
-	status = my_readlink(link, intermediate);
+	status = my_readlink(tracee, link, intermediate);
 	if (status < 0)
 		return status;
 
@@ -450,33 +602,17 @@ static int read_faked_hard_link(const char link[PATH_MAX], char intermediate[PAT
 }
 
 /**
- * Copy in @final the path of the file the faked hard link @link -- a
- * host path -- refers to.  This function returns -errno if @link is
- * not a faked hard link or if it is a broken one, otherwise 0.
+ * Copy in @final the content of the file the @intermediate_host -- a
+ * host path -- points to.  This function returns -errno if
+ * @intermediate_host can't be read, -ENOENT if it doesn't point to a
+ * file named with a link count, that is, if the chain is broken,
+ * otherwise 0.
  */
-static int resolve_faked_hard_link(const char link[PATH_MAX], char final[PATH_MAX])
-{
-	char intermediate[PATH_MAX];
-	int status;
-
-	status = read_faked_hard_link(link, intermediate);
-	if (status < 0)
-		return status;
-
-	return my_readlink(intermediate, final);
-}
-
-/**
- * Copy in @final the path of the file the @intermediate -- a host path
- * -- points to.  This function returns -errno if @intermediate can't be
- * read, -ENOENT if it doesn't point to a file named with a link count,
- * that is, if the chain is broken, otherwise 0.
- */
-static int read_intermediate(const char intermediate[PATH_MAX], char final[PATH_MAX])
+static int read_intermediate(Tracee *tracee, const char intermediate_host[PATH_MAX], char final[PATH_MAX])
 {
 	int status;
 
-	status = my_readlink(intermediate, final);
+	status = my_readlink(tracee, intermediate_host, final);
 	if (status < 0)
 		return status;
 
@@ -489,33 +625,70 @@ static int read_intermediate(const char intermediate[PATH_MAX], char final[PATH_
 }
 
 /**
- * Copy in @intermediate the path of the intermediate that points to
- * @final, a file this extension has moved into the l2s directory, c.f.
- * get_link_count().  This function returns -errno if there's none,
- * otherwise 0.
+ * Copy in @final_host the host path of the file the faked hard link
+ * @link -- a host path -- refers to.  This function returns -errno if
+ * @link is not a faked hard link or if it is a broken one, otherwise 0.
  */
-static int find_intermediate(const char final[PATH_MAX], char intermediate[PATH_MAX])
+static int resolve_faked_hard_link(Tracee *tracee, const char link[PATH_MAX], char final_host[PATH_MAX])
+{
+	char intermediate[PATH_MAX];
+	char intermediate_host[PATH_MAX];
+	char final[PATH_MAX];
+	int status;
+
+	status = read_faked_hard_link(tracee, link, intermediate);
+	if (status < 0)
+		return status;
+
+	status = l2s_content_to_host(tracee, intermediate, intermediate_host);
+	if (status < 0)
+		return status;
+
+	status = read_intermediate(tracee, intermediate_host, final);
+	if (status < 0)
+		return status;
+
+	return l2s_content_to_host(tracee, final, final_host);
+}
+
+/**
+ * Copy in @intermediate and @intermediate_host the content and host
+ * paths of the intermediate that points to @final_host, a file this
+ * extension has moved into the l2s directory, c.f. get_link_count().
+ * This function returns -errno if there's none, otherwise 0.
+ */
+static int find_intermediate(Tracee *tracee, const char final_host[PATH_MAX],
+			     char intermediate[PATH_MAX], char intermediate_host[PATH_MAX])
 {
 	char pointee[PATH_MAX];
+	char pointee_host[PATH_MAX];
 	struct stat statf;
 	struct stat statp;
 	size_t length;
 	int status;
 
 	/* "<PREFIX><name><NNNN>" lies next to "<PREFIX><name><NNNN>.<count>".  */
-	length = strrchr(final, '.') - final;
-	memcpy(intermediate, final, length);
-	intermediate[length] = '\0';
+	length = strrchr(final_host, '.') - final_host;
+	memcpy(intermediate_host, final_host, length);
+	intermediate_host[length] = '\0';
 
-	status = read_intermediate(intermediate, pointee);
+	status = read_intermediate(tracee, intermediate_host, pointee);
+	if (status < 0)
+		return status;
+
+	status = l2s_content_to_host(tracee, pointee, pointee_host);
 	if (status < 0)
 		return status;
 
 	/* The same file, whatever the path spells.  */
-	if (stat(final, &statf) < 0 || stat(pointee, &statp) < 0)
-		return -errno;
+	if (stat(final_host, &statf) < 0 || stat(pointee_host, &statp) < 0)
+		return host_errno();
 	if (statf.st_dev != statp.st_dev || statf.st_ino != statp.st_ino)
 		return -ENOENT;
+
+	length = strrchr(pointee, '.') - pointee;
+	memcpy(intermediate, pointee, length);
+	intermediate[length] = '\0';
 
 	return 0;
 }
@@ -590,9 +763,9 @@ static const char *recall_fd(pid_t pid, int fd)
  * descriptor refers to, instead of the name this file was given in the
  * l2s directory.
  */
-static void readlink_proc_fd(struct readlink_proc_fd_state *state)
+static void readlink_proc_fd(Tracee *tracee, struct readlink_proc_fd_state *state)
 {
-	char final[PATH_MAX];
+	char final_host[PATH_MAX];
 	const char *link;
 
 	/* Only files that live in the l2s directory are reported by the
@@ -606,9 +779,9 @@ static void readlink_proc_fd(struct readlink_proc_fd_state *state)
 
 	/* Descriptor numbers get reused and links get removed, so ensure
 	 * the remembered name still leads to this very file.  */
-	if (resolve_faked_hard_link(link, final) < 0)
+	if (resolve_faked_hard_link(tracee, link, final_host) < 0)
 		return;
-	if (strcmp(final, state->host_path) != 0)
+	if (strcmp(final_host, state->host_path) != 0)
 		return;
 
 	strcpy(state->host_path, link);
@@ -634,6 +807,9 @@ static void remember_dereferenced_link(Extension *extension, const char *link, c
 	const char *name;
 	size_t length;
 	size_t i;
+
+	if (in_l2s_translate)
+		return;
 
 	name = strrchr(referee, '/');
 	name = (name == NULL ? referee : name + 1);
@@ -672,8 +848,9 @@ static void remember_dereferenced_link(Extension *extension, const char *link, c
  */
 static const char *l2s_link_to_host_path(Extension *extension, const char host_path[PATH_MAX])
 {
+	Tracee *tracee = TRACEE(extension);
 	Link2SymlinkConfig *config;
-	char final[PATH_MAX];
+	char final_host[PATH_MAX];
 
 	if (!is_l2s_file(host_path))
 		return NULL;
@@ -684,9 +861,9 @@ static const char *l2s_link_to_host_path(Extension *extension, const char host_p
 
 	/* Ensure this link is indeed a faked hard link to this very file:
 	 * the tracee may have named the l2s file directly.  */
-	if (resolve_faked_hard_link(config->dereferenced_link, final) < 0)
+	if (resolve_faked_hard_link(tracee, config->dereferenced_link, final_host) < 0)
 		return NULL;
-	if (strcmp(final, host_path) != 0)
+	if (strcmp(final_host, host_path) != 0)
 		return NULL;
 
 	return config->dereferenced_link;
@@ -742,7 +919,7 @@ static int link_symbolic_link(Tracee *tracee, const char target[PATH_MAX], Reg l
 		return status;
 
 	if (symlink(target, link) < 0)
-		return -errno;
+		return host_errno();
 
 	poke_reg(tracee, SYSARG_RESULT, 0);
 	set_sysnum(tracee, PR_void);
@@ -760,9 +937,14 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 {
 	char original[PATH_MAX];
 	char intermediate[PATH_MAX];
+	char intermediate_host[PATH_MAX];
 	char new_intermediate[PATH_MAX];
+	char new_intermediate_host[PATH_MAX];
 	char final[PATH_MAX];
+	char final_host[PATH_MAX];
 	char new_final[PATH_MAX];
+	char new_final_host[PATH_MAX];
+	char newpath[PATH_MAX];
 	char * name;
 	struct stat statl;
 	ssize_t size;
@@ -788,7 +970,7 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 	/* Check if it is a symbolic link.  */
 	if (S_ISLNK(statl.st_mode)) {
 		/* get name */
-		size = my_readlink(original, intermediate);
+		size = my_readlink(tracee, original, intermediate);
 		if (size < 0)
 			return size;
 
@@ -798,9 +980,12 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		else
 			name++;
 
-		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0)
+		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0) {
+			status = l2s_content_to_host(tracee, intermediate, intermediate_host);
+			if (status < 0)
+				return status;
 			first_link = 0;
-		else {
+		} else {
 			/* An ordinary symbolic link used to be moved as a
 			 * file, under the name its content spells, followed
 			 * by the suffixes: in the directory of PRoot for a
@@ -808,7 +993,8 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 			 * absolute one, out of the guest rootfs.  */
 			return link_symbolic_link(tracee, intermediate, link_target_sysarg);
 		}
-	} else if (is_l2s_file(original) && find_intermediate(original, intermediate) == 0) {
+	} else if (is_l2s_file(original)
+		   && find_intermediate(tracee, original, intermediate, intermediate_host) == 0) {
 		/* linkat(AT_SYMLINK_FOLLOW) -- what ln(1) does on Termux
 		 * -- is handed the file a faked hard link stands for:
 		 * PRoot dereferenced that link like any symbolic link.
@@ -818,6 +1004,28 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		 * stayed as it was.  */
 		first_link = 0;
 	} else {
+		/* Try a real hard link first -- only for an ordinary file
+		 * source after classification, so an existing l2s stub or
+		 * payload is never hard-linked behind the chain's refcount.
+		 * On filesystems that support hard links (ext4/f2fs on
+		 * Android app-private storage) this preserves true hard-link
+		 * semantics; fall back to emulation only when errno indicates
+		 * hard links are unsupported here.  */
+		if (l2s_force_mode() != 1) {
+			size = read_string(tracee, newpath, peek_reg(tracee, CURRENT, link_target_sysarg), PATH_MAX);
+			if (size < 0)
+				return size;
+			if (size >= PATH_MAX)
+				return -ENAMETOOLONG;
+			if (link(original, newpath) == 0) {
+				poke_reg(tracee, SYSARG_RESULT, 0);
+				set_sysnum(tracee, PR_void);
+				return 0;
+			}
+			if (!link_errno_means_unsupported(errno))
+				return host_errno();
+		}
+
 		/* compute new name */
 		name = strrchr(original,'/');
 		if (name == NULL)
@@ -826,36 +1034,49 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 			name++;
 
 		if (get_l2s_directory()) {
+			const char *host = l2s_host_directory(tracee);
+			if (host == NULL)
+				return -ENOENT;
+
 			/* "<l2s>/<PREFIX><name>" plus the four digits of the
-			 * suffix and the ".0002" of the final file.  The
-			 * bound used to be computed from the *directory* of
-			 * @original, which says nothing about the length of
-			 * the name appended here: a short directory and a
-			 * long name passed it and then overran these
-			 * buffers.  */
-			if (l2s_directory_length + strlen(PREFIX) + strlen(name) + 11 >= PATH_MAX)
+			 * suffix and the ".0002" of the final file.  */
+			if (l2s_directory_length + strlen(PREFIX) + strlen(name) + 11 >= PATH_MAX
+			    || l2s_dir_host_length + strlen(PREFIX) + strlen(name) + 11 >= PATH_MAX)
 				return -ENAMETOOLONG;
 
 			/* Ask for the descriptor here, so a directory that
 			 * can't be opened is reported with the reason it
-			 * can't -- ENOTDIR for the symbolic link a tracee
-			 * left under that name -- instead of surfacing as
-			 * whichever of the operations below fails first.  */
-			status = open_l2s_directory();
+			 * can't -- ELOOP/ENOTDIR for a symbolic link a tracee
+			 * left under that name -- while a directory that was
+			 * never created or was deleted beforehand is recreated
+			 * once on demand.  */
+			status = open_l2s_directory(tracee);
+			if (status == -ENOENT && l2s_directory_fd < 0) {
+				if (mkdir(host, 0700) == 0)
+					status = open_l2s_directory(tracee);
+			}
 			if (status < 0)
 				return status;
 
 			strcpy(intermediate, l2s_directory);
 			strcat(intermediate, "/");
+			strcat(intermediate, PREFIX);
+			strcat(intermediate, name);
+
+			strcpy(intermediate_host, host);
+			strcat(intermediate_host, "/");
+			strcat(intermediate_host, PREFIX);
+			strcat(intermediate_host, name);
 		} else {
 			if (strlen(PREFIX) + strlen(original) + 5 >= PATH_MAX)
 				return -ENAMETOOLONG;
 
 			strncpy(intermediate, original, strlen(original) - strlen(name));
 			intermediate[strlen(original) - strlen(name)] = '\0';
+			strcat(intermediate, PREFIX);
+			strcat(intermediate, name);
+			strcpy(intermediate_host, intermediate);
 		}
-		strcat(intermediate, PREFIX);
-		strcat(intermediate, name);
 	}
 
 	if (first_link) {
@@ -877,45 +1098,53 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 			status = snprintf(final, PATH_MAX, "%s%04d.0002", intermediate, intermediate_suffix);
 			if (status < 0 || status >= PATH_MAX)
 				return -ENAMETOOLONG;
+			status = snprintf(final_host, PATH_MAX, "%s%04d.0002", intermediate_host, intermediate_suffix);
+			if (status < 0 || status >= PATH_MAX)
+				return -ENAMETOOLONG;
 			sprintf(new_intermediate, "%s%04d", intermediate, intermediate_suffix);
+			sprintf(new_intermediate_host, "%s%04d", intermediate_host, intermediate_suffix);
 
-			if (l2s_lstat(final, &statl) == 0)
+			if (l2s_lstat(tracee, final_host, &statl) == 0)
 				continue;
 
-			if (l2s_symlink(final, new_intermediate) == 0)
+			if (l2s_symlink(tracee, final, new_intermediate_host) == 0)
 				break;
 
 			if (errno != EEXIST)
-				return -errno;
+				return host_errno();
 		}
 		strcpy(intermediate, new_intermediate);
+		strcpy(intermediate_host, new_intermediate_host);
 
 		/*Move the original content to the new path. */
-		status = l2s_rename(original, final);
+		status = l2s_rename(tracee, original, final_host);
 		if (status < 0) {
-			status = -errno;
-			(void) l2s_unlink(intermediate);
+			status = host_errno();
+			(void) l2s_unlink(tracee, intermediate_host);
 			return status;
 		}
-		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) original, (intptr_t) final);
+		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) original, (intptr_t) final_host);
 
 		/* Symlink the original path to the intermediate one.  */
 		if (status >= 0 && symlink(intermediate, original) < 0)
-			status = -errno;
+			status = host_errno();
 
 		/* Otherwise put the file back where it was, unless its name
 		 * was taken in the meantime.  */
 		if (status < 0) {
-			if (status != -EEXIST && l2s_rename(final, original) == 0) {
+			if (status != -EEXIST && l2s_rename(tracee, final_host, original) == 0) {
 				(void) notify_extensions(tracee, LINK2SYMLINK_RENAME,
-							(intptr_t) final, (intptr_t) original);
-				(void) l2s_unlink(intermediate);
+							(intptr_t) final_host, (intptr_t) original);
+				(void) l2s_unlink(tracee, intermediate_host);
 			}
 			return status;
 		}
 	} else {
 		/*Move the original content to new location, by incrementing count at end of path. */
-		status = read_intermediate(intermediate, final);
+		status = read_intermediate(tracee, intermediate_host, final);
+		if (status < 0)
+			return status;
+		status = l2s_content_to_host(tracee, final, final_host);
 		if (status < 0)
 			return status;
 
@@ -926,29 +1155,33 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		status = name_link_count(final, link_count + 1, new_final);
 		if (status < 0)
 			return status;
-
-		status = l2s_rename(final, new_final);
+		status = name_link_count(final_host, link_count + 1, new_final_host);
 		if (status < 0)
-			return -errno;
-		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final, (intptr_t) new_final);
+			return status;
+
+		status = l2s_rename(tracee, final_host, new_final_host);
+		if (status < 0)
+			return host_errno();
+		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final_host, (intptr_t) new_final_host);
 		if (status < 0)
 			return status;
 		strcpy(final, new_final);
+		strcpy(final_host, new_final_host);
 		/* Symlink the intermediate to the final file.  */
-		status = l2s_unlink(intermediate);
+		status = l2s_unlink(tracee, intermediate_host);
 		if (status < 0)
-			return -errno;
-		status = l2s_symlink(final, intermediate);
+			return host_errno();
+		status = l2s_symlink(tracee, final, intermediate_host);
 		if (status < 0)
-			return -errno;
+			return host_errno();
 	}
 
 	/* Perform symlink() operation within PRoot.  */
-	status = read_path(tracee, final, peek_reg(tracee, CURRENT, link_target_sysarg));
-	if (status >= 0 && symlink(intermediate, final) < 0)
-		status = -errno;
+	status = read_path(tracee, newpath, peek_reg(tracee, CURRENT, link_target_sysarg));
+	if (status >= 0 && symlink(intermediate, newpath) < 0)
+		status = host_errno();
 	if (status < 0) {
-		(void) decrement_intermediate_count(tracee, original, intermediate);
+		(void) decrement_intermediate_count(tracee, original, intermediate_host);
 		return status;
 	}
 	poke_reg(tracee, SYSARG_RESULT, 0);
@@ -959,24 +1192,27 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 
 
 /**
- * Decrement the count of the file the @intermediate of the faked hard
- * link @original -- both host paths -- points to, deleting both of them
- * when it was the last link.  This function returns -errno if an error
- * occured, otherwise 0.
+ * Decrement the count of the file the @intermediate_host of the faked
+ * hard link @original -- both host paths -- points to, deleting both of
+ * them when it was the last link.  This function returns -errno if an
+ * error occured, otherwise 0.
  */
 static int decrement_intermediate_count(Tracee *tracee, const char original[PATH_MAX],
-					const char intermediate[PATH_MAX])
+					const char intermediate_host[PATH_MAX])
 {
 	char final[PATH_MAX];
+	char final_host[PATH_MAX];
 	char new_final[PATH_MAX];
+	char new_final_host[PATH_MAX];
 	int status;
 	int link_count;
 
 	/* Read intermediate link - if this fails then
 	 * this link2symlink is broken and we silently
 	 * skip as we were removing it anyway.  */
-	if (read_intermediate(intermediate, final) < 0) {
-		VERBOSE(tracee, 1, "Skiping deref of broken link2symlink \"%s\" -> \"%s\"", original, intermediate);
+	if (read_intermediate(tracee, intermediate_host, final) < 0
+	    || l2s_content_to_host(tracee, final, final_host) < 0) {
+		VERBOSE(tracee, 1, "Skiping deref of broken link2symlink \"%s\" -> \"%s\"", original, intermediate_host);
 		return 0;
 	}
 
@@ -988,36 +1224,39 @@ static int decrement_intermediate_count(Tracee *tracee, const char original[PATH
 		status = name_link_count(final, link_count, new_final);
 		if (status < 0)
 			return status;
-
-		status = l2s_rename(final, new_final);
+		status = name_link_count(final_host, link_count, new_final_host);
 		if (status < 0)
-			return -errno;
-		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final, (intptr_t) new_final);
+			return status;
+
+		status = l2s_rename(tracee, final_host, new_final_host);
+		if (status < 0)
+			return host_errno();
+		status = notify_extensions(tracee, LINK2SYMLINK_RENAME, (intptr_t) final_host, (intptr_t) new_final_host);
 		if (status < 0)
 			return status;
 
 		strcpy(final, new_final);
 
 		/* Symlink the intermediate to the final file.  */
-		status = l2s_unlink(intermediate);
+		status = l2s_unlink(tracee, intermediate_host);
 		if (status < 0)
-			return -errno;
+			return host_errno();
 
-		status = l2s_symlink(final, intermediate);
+		status = l2s_symlink(tracee, final, intermediate_host);
 		if (status < 0)
-			return -errno;
+			return host_errno();
 	} else {
 		/* If it is the last, delete the intermediate and final */
-		status = l2s_unlink(intermediate);
+		status = l2s_unlink(tracee, intermediate_host);
 		if (status < 0)
-			return -errno;
-		status = l2s_unlink(final);
+			return host_errno();
+		status = l2s_unlink(tracee, final_host);
 		if (status < 0)
-			return -errno;
-		status = notify_extensions(tracee, LINK2SYMLINK_UNLINK, (intptr_t) final, 0);
+			return host_errno();
+		status = notify_extensions(tracee, LINK2SYMLINK_UNLINK, (intptr_t) final_host, 0);
 		if (status < 0)
 			return status;
-		}
+	}
 
 	return 0;
 }
@@ -1047,7 +1286,7 @@ static int remember_removed_link(Extension *extension, Reg sysarg)
 	if (size >= PATH_MAX)
 		return -ENAMETOOLONG;
 
-	if (read_faked_hard_link(link, intermediate) < 0)
+	if (read_faked_hard_link(tracee, link, intermediate) < 0)
 		return 0;
 
 	config = get_config(extension, true);
@@ -1094,7 +1333,7 @@ static int prepare_rename(Extension *extension, Reg old_sysarg, Reg new_sysarg, 
 	if (size >= PATH_MAX)
 		return -ENAMETOOLONG;
 
-	if (read_faked_hard_link(old_path, old_intermediate) < 0
+	if (read_faked_hard_link(tracee, old_path, old_intermediate) < 0
 	    || strcmp(old_intermediate, config->removed_intermediate) != 0)
 		return 0;
 
@@ -1124,16 +1363,22 @@ static int prepare_rename(Extension *extension, Reg old_sysarg, Reg new_sysarg, 
 static int decrement_removed_link_count(Tracee *tracee, const char link[PATH_MAX],
 					const char intermediate[PATH_MAX])
 {
+	char intermediate_host[PATH_MAX];
 	char directory[PATH_MAX];
 	struct stat statl;
 	char *slash;
 	int status;
 
-	status = decrement_intermediate_count(tracee, link, intermediate);
+	if (l2s_content_to_host(tracee, intermediate, intermediate_host) < 0) {
+		VERBOSE(tracee, 1, "Skiping deref of broken link2symlink \"%s\" -> \"%s\"", link, intermediate);
+		return 0;
+	}
+
+	status = decrement_intermediate_count(tracee, link, intermediate_host);
 	if (status != -EACCES)
 		return status;
 
-	strcpy(directory, intermediate);
+	strcpy(directory, intermediate_host);
 	slash = strrchr(directory, '/');
 	if (slash == NULL || slash == directory)
 		return status;
@@ -1143,7 +1388,7 @@ static int decrement_removed_link_count(Tracee *tracee, const char link[PATH_MAX
 	    || chmod(directory, (statl.st_mode & 07777) | S_IWUSR) < 0)
 		return status;
 
-	status = decrement_intermediate_count(tracee, link, intermediate);
+	status = decrement_intermediate_count(tracee, link, intermediate_host);
 
 	(void) chmod(directory, statl.st_mode & 07777);
 
@@ -1173,7 +1418,7 @@ static void forget_removed_link(Extension *extension)
 	 * stage of rename(2) even turns that into 0.  The name must be
 	 * gone too, or be another file's after rename(2).  */
 	if ((int) peek_reg(tracee, CURRENT, SYSARG_RESULT) == 0
-	    && (my_readlink(config->removed_link, value) < 0
+	    && (my_readlink(tracee, config->removed_link, value) < 0
 		|| strcmp(value, config->removed_intermediate) != 0)) {
 		status = decrement_removed_link_count(tracee, config->removed_link,
 						      config->removed_intermediate);
@@ -1191,23 +1436,23 @@ static void forget_removed_link(Extension *extension)
  * file, c.f. translated_path().  This function returns -errno if @path
  * is not a faked hard link, or if its file can't be reached.
  */
-static int get_faked_hard_link_type(const char path[PATH_MAX])
+static int get_faked_hard_link_type(Tracee *tracee, const char path[PATH_MAX])
 {
-	char final[PATH_MAX];
+	char final_host[PATH_MAX];
 	struct stat statl;
 	int status;
 
-	status = resolve_faked_hard_link(path, final);
+	status = resolve_faked_hard_link(tracee, path, final_host);
 	if (status < 0)
 		return status;
 
-	/* The paths this extension records are absolute; a relative one
-	 * would be resolved against the directory of PRoot.  */
-	if (final[0] != '/')
+	/* The paths this extension resolves to are absolute; a relative
+	 * one would be resolved against the directory of PRoot.  */
+	if (final_host[0] != '/')
 		return -EINVAL;
 
-	if (l2s_lstat(final, &statl) < 0)
-		return -errno;
+	if (l2s_lstat(tracee, final_host, &statl) < 0)
+		return host_errno();
 
 	return IFTODT(statl.st_mode);
 }
@@ -1315,7 +1560,7 @@ static int handle_getdents_exit(Tracee *tracee)
 		if (status < 0 || status >= PATH_MAX)
 			continue;
 
-		status = get_faked_hard_link_type(path);
+		status = get_faked_hard_link_type(tracee, path);
 		if (status < 0 || status == DT_LNK)
 			continue;
 
@@ -1391,7 +1636,9 @@ static int handle_sysexit_end(Extension *extension)
 		ssize_t size;
 		char original[PATH_MAX];
 		char intermediate[PATH_MAX];
+		char intermediate_host[PATH_MAX];
 		char final[PATH_MAX];
+		char final_host[PATH_MAX];
 		char * name;
 		struct stat finalStat;
 		int link_count;
@@ -1442,10 +1689,10 @@ static int handle_sysexit_end(Extension *extension)
 
 		if (strncmp(name, PREFIX, strlen(PREFIX)) == 0) {
 			if (S_ISLNK(statl.st_mode)) {
-				strcpy(intermediate,original);
+				strcpy(intermediate_host, original);
 				goto intermediate_proc;
 			} else {
-				strcpy(final,original);
+				strcpy(final_host, original);
 				goto final_proc;
 			}
 		}
@@ -1460,7 +1707,7 @@ static int handle_sysexit_end(Extension *extension)
 		 * dangling symbolic link it is.  Failing this syscall made it
 		 * impossible to lstat(2), hence to list or to remove with
 		 * most tools.  */
-		if (my_readlink(original, intermediate) < 0)
+		if (my_readlink(tracee, original, intermediate) < 0)
 			return 0;
 
 		name = strrchr(intermediate, '/');
@@ -1472,13 +1719,18 @@ static int handle_sysexit_end(Extension *extension)
 		if (strncmp(name, PREFIX, strlen(PREFIX)) != 0)
 			return 0;
 
+		if (l2s_content_to_host(tracee, intermediate, intermediate_host) < 0)
+			return 0;
+
 		intermediate_proc:
-		if (read_intermediate(intermediate, final) < 0)
+		if (read_intermediate(tracee, intermediate_host, final) < 0)
+			return 0;
+		if (l2s_content_to_host(tracee, final, final_host) < 0)
 			return 0;
 
 		final_proc:
-		link_count = get_link_count(final);
-		if (link_count < 0 || lstat(final, &finalStat) < 0)
+		link_count = get_link_count(final_host);
+		if (link_count < 0 || l2s_lstat(tracee, final_host, &finalStat) < 0)
 			return 0;
 
 		finalStat.st_nlink = link_count;
@@ -1596,7 +1848,10 @@ static void translated_path(Extension *extension, char translated_path[PATH_MAX]
 {
 	Tracee *tracee = TRACEE(extension);
 	Link2SymlinkConfig *config;
-	char final[PATH_MAX];
+	char final_host[PATH_MAX];
+
+	if (in_l2s_translate)
+		return;
 
 	/* Don't translate l2s symlinks if call is (un)link */
 	Sysnum sysnum = get_sysnum(tracee, ORIGINAL);
@@ -1618,12 +1873,12 @@ static void translated_path(Extension *extension, char translated_path[PATH_MAX]
 	 * not to -- lstat(2), open(O_NOFOLLOW), ... -- in which case
 	 * that is done here.  The name of that link is remembered the
 	 * same way, a faked hard link is a regular file to the tracee.  */
-	if (resolve_faked_hard_link(translated_path, final) == 0) {
+	if (resolve_faked_hard_link(tracee, translated_path, final_host) == 0) {
 		config = get_config(extension, true);
 		if (config != NULL)
 			strcpy(config->dereferenced_link, translated_path);
 
-		strcpy(translated_path, final);
+		strcpy(translated_path, final_host);
 	}
 
 	if (is_open_syscall(sysnum))
@@ -1941,6 +2196,9 @@ int link2symlink_callback(Extension *extension, ExtensionEvent event,
 	}
 
 	case GUEST_PATH: {
+		if (in_l2s_translate)
+			return 0;
+
 		/* A new path is about to be canonicalized.  */
 		Link2SymlinkConfig *config = get_config(extension, false);
 		if (config != NULL)
@@ -1962,7 +2220,7 @@ int link2symlink_callback(Extension *extension, ExtensionEvent event,
 		return 0;
 
 	case READLINK_PROC_FD:
-		readlink_proc_fd((struct readlink_proc_fd_state *) data1);
+		readlink_proc_fd(TRACEE(extension), (struct readlink_proc_fd_state *) data1);
 		return 0;
 
 	case EXECVE_PROC_EXE:

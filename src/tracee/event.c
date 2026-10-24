@@ -700,8 +700,6 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 						seccomp_after_ptrace_enter ? "new" : "old");
 			}
 
-			tracee->skip_next_seccomp_signal = false;
-
 			/* If kernel triggered seccomp event after we handled
 			 * syscall enter, skip this event and continue as it didn't happen */
 			if (seccomp_after_ptrace_enter && !IS_IN_SYSENTER(tracee))
@@ -714,6 +712,8 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 				assert(tracee->restart_how != PTRACE_CONT);
 				break;
 			}
+
+			tracee->skip_next_seccomp_signal = false;
 
 			assert(IS_IN_SYSENTER(tracee));
 
@@ -759,6 +759,8 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 				if (seccomp_after_ptrace_enter) {
 					tracee->restart_how = PTRACE_SYSCALL;
 					translate_syscall(tracee);
+					tracee->skip_next_seccomp_signal =
+						(get_sysnum(tracee, CURRENT) == PR_void);
 				}
 				tracee->restart_how = PTRACE_SYSCALL;
 				break;
@@ -768,6 +770,8 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 			 * stage right now.  */
 			tracee->restart_how = PTRACE_CONT;
 			translate_syscall(tracee);
+			tracee->skip_next_seccomp_signal =
+				(get_sysnum(tracee, CURRENT) == PR_void);
 
 			/* Sysenter handler may have requested sysexit
 			 * interception by setting sysexit_pending.  */
