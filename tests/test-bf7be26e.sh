@@ -2,6 +2,12 @@ if [ -z "$(which mcookie)" ] || [ -z "$(which ln)" ] || [ -z "$(which find)" ]; 
     exit 125;
 fi
 
+# This test asserts the symlink-chain encoding, which only exists when
+# link2symlink emulates hard links.  The fork serves hard links natively
+# where the host allows it, so force the emulation to exercise the path
+# under test (same convention as test-l2s-*.sh).
+export PROOT_L2S_FORCE=1
+
 # A faked hard link whose backing files are gone -- removed along with
 # the directory of the first name of its file, where they are kept when
 # PROOT_L2S_DIR is not set -- couldn't be lstat(2)ed anymore: the stat

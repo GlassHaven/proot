@@ -2,6 +2,12 @@ if [ -z "$(which mcookie)" ] || [ -z "$(which gcc)" ] || [ -z "$(which find)" ];
     exit 125;
 fi
 
+# This test asserts the symlink-chain encoding, which only exists when
+# link2symlink emulates hard links.  The fork serves hard links natively
+# where the host allows it, so force the emulation to exercise the path
+# under test (same convention as test-l2s-*.sh).
+export PROOT_L2S_FORCE=1
+
 # link2symlink records the link count of a file in its name, with 4
 # digits up to 9999 links and 5 from 10000 on, but read it back as its
 # last 4 characters.  The 10000th link therefore left a chain that

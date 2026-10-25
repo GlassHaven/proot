@@ -2,6 +2,12 @@ if [ -z "$(which mcookie)" ] || [ -z "$(which gcc)" ]; then
     exit 125;
 fi
 
+# This test asserts the symlink-chain encoding, which only exists when
+# link2symlink emulates hard links.  The fork serves hard links natively
+# where the host allows it, so force the emulation to exercise the path
+# under test (same convention as test-l2s-*.sh).
+export PROOT_L2S_FORCE=1
+
 # link2symlink handed the -1 of the host syscalls its emulation of
 # link(2) is made of -- rename(2), symlink(2), readlink(2), ... -- to
 # the tracee as is, that is, as -EPERM, instead of their errno.
